@@ -56,11 +56,12 @@ that page as of 2026-10-22; check the page for updates.
 ## Quick start
 
 ```bash
-./emudhra-audit.sh              # full audit with live TLS probes and guidance
+./emudhra-audit.sh              # compact audit with live TLS probes: one line per item
 ./emudhra-audit.sh --no-network # version checks only (no connections)
 ./emudhra-audit.sh -v           # the full report: path, version and probe result for every item
 ./emudhra-audit.sh -vv          # also show the probe commands and raw TLS errors
 ./emudhra-audit.sh --fix --dry-run  # show exactly what a fix would do; change nothing
+./emudhra-audit.sh --undo --dry-run # show which backups --undo would restore
 ```
 
 No installation is needed. The script is a single file; make it executable with `chmod +x emudhra-audit.sh` if required.
@@ -116,7 +117,8 @@ pyenv, SDKMAN, Homebrew, `/usr/lib/jvm`, `/Library/Java/JavaVirtualMachines` and
 
 ### Environment overrides
 
-The script starts with a "CA-related environment" section listing variables that change which trust store a tool uses
+With `-v` the report starts with a "CA-related environment" section listing variables that change which trust store a tool
+uses. In the default output that section only appears when one of them is set or a warning applies
 (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `GIT_SSL_CAINFO`,
 `NODE_EXTRA_CA_CERTS`, `NODE_USE_SYSTEM_CA`). It warns about settings that disable verification
 (`GIT_SSL_NO_VERIFY`, `NODE_TLS_REJECT_UNAUTHORIZED=0`). The probes inherit your environment, so results describe how
@@ -183,12 +185,13 @@ current platform is printed, and only if an affected item needs it.
 
 Prefer upgrading over the workaround. The workaround removes two widely used roots (`AAA Certificate Services` and
 `emSign ECC Root CA - G3`) from the trust store, which can break legitimate sites that chain to them, and an OS update may
-replace the edited file. Java and Electron apps use their own trust lists, so OS-level workarounds do not help them; they need an upgrade. Node.js
-uses its own bundled list by default; the script tests `--use-system-ca` and says whether it helps on your machine.
+replace the edited file. Java and Electron apps use their own trust lists, so OS-level workarounds do not help them; they
+need an upgrade. Node.js uses its own bundled list by default; the script tests `--use-system-ca` and says whether it helps
+on your machine.
 
 If no fixed JDK build is available yet, the guidance for a Java install also prints a stop-gap: back up that JDK's
-`cacerts` and delete the entries for the two roots. It is untested as a fix, makes Java reject sites chained to those
-roots, and is undone by a JDK upgrade or by restoring the backup.
+`cacerts` and delete the entries for the two roots. It makes Java reject sites chained to those roots, and is undone by
+a JDK upgrade or by restoring the backup. `--fix --only=java` applies it for you, after testing it on a copy.
 
 **Without `--fix` the script never runs any of this guidance.** It only prints it. Read each command before running it; the
 trust-store commands need `sudo`.
@@ -214,7 +217,8 @@ script refuses to proceed if a change would remove more than expected.
 
 ### Safeguards
 
-Each change follows the same sequence:
+Each change follows the same sequence (Debian, Ubuntu, Alpine and Fedora differ slightly; see
+[Known limitations](#known-limitations-of---fix)):
 
 1. The new file or store is built on a **copy** first.
 2. The copy is **tested**: it must reject the compromised chain, and it must still validate GitHub, Google, PyPI, Maven
@@ -251,7 +255,7 @@ finds. `--undo` also removes the p11-kit blocklist files that `--fix` created. H
 | `--dry-run` on macOS for `sys`, `java`, `brew` and `macpip` | Tested. |
 | The confirmation prompt under a real pseudo-terminal, and refusal with no terminal (`tests/test_confirm_prompt.sh`) | Tested. The test fails on the earlier code that lost the terminal. |
 | `--yes` validation, bad flags | Tested. |
-| The macOS system-bundle edit, `brew` upgrade and Java `cacerts` fix on a real machine | Applied for real by the maintainer's own `--fix` run on macOS; the audit afterwards reports the items as protected. Not independently observed by the test suite. |
+| The macOS system-bundle edit, `brew` upgrade and Java `cacerts` fix on a real machine | Applied on a real macOS machine (the backups and a follow-up audit confirm it): the affected items then report as protected. This is not covered by the automated tests. |
 | The macOS `macpip` fix | **Not applied for real.** Dry run only. |
 | openSUSE/SLES, Arch, NixOS, RHEL/CentOS/Rocky/Alma, Amazon Linux, FreeBSD, NetBSD | **Not tested.** The SUSE and Arch paths reuse the Fedora blocklist code with different directories. |
 | Linux on x86-64 | Tested on arm64 containers only. |
@@ -262,9 +266,10 @@ to read what it prints.
 
 ### Known limitations of `--fix`
 
-- On Debian, Ubuntu and Alpine the change is verified **after** it is installed (and rolled back if it fails), not on a
+- On Debian, Ubuntu, Alpine and Fedora the change is verified **after** it is installed (and rolled back if it fails), not on a
   copy beforehand. The macOS bundle and Java stores are tested on a copy first.
 - `--undo` does not reverse a Homebrew upgrade.
+- `--fix` needs the live probes to verify its work, so it cannot be combined with `--no-network`.
 - The Alpine and Debian fixes disable the roots in `ca-certificates.conf`; a later `ca-certificates` package upgrade is the
   proper fix and replaces that file.
 
@@ -279,9 +284,10 @@ to read what it prints.
     checked by version only.
   - Testing CA bundle files and Homebrew's bundle uses a Python 3.8 or later interpreter found by the audit.
 
-Tested on macOS (Apple silicon) with Bash 3.2. The Linux and BSD code paths (package checks, per-distribution guidance and
-the `--fix` recipes) have **not** been exercised yet. The macOS workaround edits `/etc/ssl/cert.pem`; reports differ on whether macOS updates
-refresh that file, so re-run the audit after updating rather than assuming.
+Tested on macOS (Apple silicon) with Bash 3.2, and on Debian 12, Ubuntu 24.04, Alpine 3.18/3.20 and Fedora 41 in arm64
+containers. The BSDs, openSUSE, Arch, NixOS, RHEL-family distributions other than Fedora, and x86-64 Linux have **not** been
+exercised; see [What has been tested](#what-has-been-tested). The macOS workaround edits `/etc/ssl/cert.pem`; reports
+differ on whether macOS updates refresh that file, so re-run the audit after updating rather than assuming.
 
 ## Safety
 
@@ -290,8 +296,9 @@ refresh that file, so re-run the audit after updating rather than assuming.
 - It writes small probe programs (Python, Go, Java, Node.js, Deno, Bun) into a private temporary directory and removes it
   on exit. Go probes run with `GOTOOLCHAIN=local` so Go does not download another toolchain, and Python runs in isolated
   mode (`-I`).
-- Live probes make ordinary HTTPS requests to the two test hosts published on the reference page and to `github.com`.
-  Nothing is sent beyond a normal `GET /`.
+- Live probes make ordinary HTTPS requests to the two test hosts published on the reference page and to `github.com`: a
+  `GET /` from curl, Go, Python, Java, Node.js, Deno and Bun; `git ls-remote` (a `GET /info/refs`); and `pip download` for
+  a package that does not exist (a `GET /simple/...`). They send no file contents.
 - Without `--fix`, guidance is text only.
 
 ## Limitations
@@ -314,6 +321,25 @@ those values and the `VERSION_OF_SCRIPT` number.
 ## Development
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for details.
+
+### Tests
+
+```bash
+tests/test_strip_roots.sh [BUNDLE]        # root-stripping logic against a real CA bundle (read-only)
+tests/test_confirm_prompt.sh              # --fix prompt under a real pseudo-terminal, using a throwaway JDK copy
+tests/test_linux_containers.sh [IMAGE...] # --fix and --undo cycles in throwaway Linux containers (needs Docker)
+```
+
+`test_confirm_prompt.sh` needs `python3` and a JDK with `keytool`. `test_linux_containers.sh` mounts the repository
+read-only and removes each container afterwards. For testing, `EMUDHRA_JAVA_HOMES` (space-separated paths) replaces JDK
+discovery, so a fix can be pointed at a copy instead of a real JDK.
+
+### Releasing
+
+1. Update `VERSION_OF_SCRIPT` in `emudhra-audit.sh`, and the fixed versions if the reference page has changed.
+2. Run the tests above and check the README still matches the behaviour.
+3. Commit, then tag and push: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
+4. Create the GitHub release with `gh release create vX.Y.Z`, attaching `emudhra-audit.sh`.
 
 ## The Fine Print
 
