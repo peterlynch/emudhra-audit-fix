@@ -16,10 +16,16 @@
 # The probe is authoritative; the version check explains and backs it up.
 #
 # Affected items get remediation guidance (taken from the reference page).
-# Guidance is only ever printed; this script never runs it.
 #
-# Audit only: nothing is installed, changed or removed. Small probe programs
-# are written to a private temp directory, which is deleted on exit.
+# By default the script is read-only: nothing is installed, changed or removed,
+# and guidance is only printed. Small probe programs are written to a private
+# temp directory, which is deleted on exit.
+#
+# With --fix it can also apply the fixes it knows about (system CA bundle,
+# Java cacerts, Homebrew ca-certificates, macOS built-in pip). Each change is
+# confirmed, verified on a copy first, backed up with a timestamp, re-verified
+# after install and rolled back if it fails. --dry-run shows the plan without
+# changing anything; --undo restores the backups.
 #
 # Portable: bash 3.2+ (stock macOS) and Linux. No jq/python needed by the
 # script itself.
@@ -27,28 +33,47 @@
 # Exit status: 0 = nothing affected, 1 = at least one tool affected/likely
 # affected, 2 = usage error.
 
-VERSION_OF_SCRIPT=0.3.0
+VERSION_OF_SCRIPT=0.4.0
 
 BAD_URLS="https://dv-g3b-emudhra.we-have-a-problem.com/ https://dv-g3b-aaa-emudhra.we-have-a-problem.com/"
-CONTROL_URL="https://example.com/"
+# The control host must NOT chain to either root the advisory says to distrust, or a correctly
+# patched trust store would fail it and look broken. (example.com chains to AAA Certificate Services.)
+CONTROL_URL="https://github.com/"
 
 NO_NETWORK=0
 VERBOSE=0
 NO_GUIDE=0
+FIXMODE=0
+DRY=0
+YES=0
+UNDO=0
+WORKAROUND_ONLY=0
+ONLY=
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [--no-network] [--no-guidance] [--verbose] [-h|--help]
+Usage: ${0##*/} [options]
 
-Read-only audit of developer tools (curl, git, Go, Python, Java, Node.js, Deno, Bun,
-rustup, uv, pixi, mise, Claude Code, Electron apps, Homebrew and OS CA bundles)
-against the eMudhra intermediate CA compromise. Prints remediation guidance for
-anything affected; it never changes the system.
+Audit of developer tools (curl, git, Go, Python, Java, Node.js, Deno, Bun, rustup, uv,
+pixi, mise, Claude Code, Electron apps, Homebrew and OS CA bundles) against the eMudhra
+intermediate CA compromise. By default it is read-only: it prints remediation guidance
+for anything affected and changes nothing.
 
-  --no-network    skip live TLS probes; version checks only
-  --no-guidance   do not print remediation guidance
-  --verbose       print the probe commands that are run, and raw TLS errors
-  -h, --help      show this help
+Audit options:
+  --no-network      skip live TLS probes; version checks only
+  --no-guidance     do not print remediation guidance
+  --verbose         print the probe commands that are run, and raw TLS errors
+
+Fix options (these can modify the system; sudo is used where needed):
+  --fix             after the audit, offer to apply fixes, asking before each change
+  --dry-run         with --fix: verify and show every step but change nothing
+  --yes             with --fix: do not ask before each change
+  --workaround-only with --fix: skip the vendor package upgrade on Linux and go straight
+                    to blocking the two roots
+  --only=KIND       with --fix: apply only one kind of fix: brew, sys, java or macpip
+  --undo            restore the backups made by --fix (asks first; honours --dry-run/--yes)
+
+  -h, --help        show this help
 EOF
 }
 
@@ -57,10 +82,27 @@ for arg in "$@"; do
     --no-network)  NO_NETWORK=1 ;;
     --no-guidance) NO_GUIDE=1 ;;
     --verbose)     VERBOSE=1 ;;
+    --fix)         FIXMODE=1 ;;
+    --dry-run)     DRY=1; FIXMODE=1 ;;
+    --yes)         YES=1 ;;
+    --undo)        UNDO=1 ;;
+    --only=*)      ONLY=${arg#--only=} ;;
+    --workaround-only) WORKAROUND_ONLY=1 ;;
     -h|--help)    usage; exit 0 ;;
     *)            echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [ "$UNDO" -eq 1 ] && [ "$FIXMODE" -eq 1 ] && [ "$DRY" -eq 0 ]; then
+  echo "--undo cannot be combined with --fix" >&2; exit 2
+fi
+case $ONLY in ""|brew|sys|java|macpip) ;; *) echo "--only must be one of: brew, sys, java, macpip" >&2; exit 2 ;; esac
+if [ "$YES" -eq 1 ] && [ "$FIXMODE" -eq 0 ] && [ "$UNDO" -eq 0 ]; then
+  echo "--yes only makes sense with --fix or --undo" >&2; exit 2
+fi
+if [ "$FIXMODE" -eq 1 ] && [ "$NO_NETWORK" -eq 1 ]; then
+  echo "--fix needs the live probes to verify its changes; do not combine it with --no-network" >&2; exit 2
+fi
 
 TMP=$(mktemp -d 2>/dev/null || mktemp -d -t emudhra)
 if [ -z "$TMP" ] || [ ! -d "$TMP" ]; then
@@ -87,6 +129,8 @@ BREW_PREFIX=
 PYBIN=
 PROBE_RES=
 NODE_SYSCA_RES=
+JAVA_PROBE_OK=0         # 1 once a Java probe class has been compiled
+PLAN=$'\n'              # fixes this script can apply: kind|target lines (see plan_add)
 
 # ---------------------------------------------------------------- helpers
 
@@ -159,6 +203,12 @@ resolve() {
   done
   d=$(cd -P "$(dirname "$p")" 2>/dev/null && pwd) || { echo "$p"; return; }
   echo "$d/$(basename "$p")"
+}
+
+# plan_add KIND TARGET : record a fix that --fix can apply (deduplicated).
+plan_add() {
+  case $PLAN in *$'\n'"$1|$2"$'\n'*) return 0 ;; esac
+  PLAN="$PLAN$1|$2"$'\n'
 }
 
 # Returns 1 if key was already seen, else records it.
@@ -260,8 +310,8 @@ report() {
   case $status in
     AFFECTED|LIKELY-AFFECTED)
       N_BAD=$((N_BAD + 1)); col=$C_RED
-      [ "$FIXSYS" = 1 ] && NEED_SYS=1
-      [ "$FIXPIP" = 1 ] && NEED_PIPMAC=1
+      [ "$FIXSYS" = 1 ] && { NEED_SYS=1; plan_add sys system; }
+      [ "$FIXPIP" = 1 ] && { NEED_PIPMAC=1; plan_add macpip /usr/bin/python3; }
       GUIDE="${GUIDE}  - ${tool} ${ver}"$'\n'"    ${path}"$'\n'"${fx}"$'\n' ;;
     OK|LIKELY-OK)
       N_OK=$((N_OK + 1)); col=$C_GRN
@@ -658,6 +708,11 @@ check_java_version() {
 
 java_candidates() {
   local p d
+  # Testing aid: EMUDHRA_JAVA_HOMES (space-separated) replaces normal discovery.
+  if [ -n "${EMUDHRA_JAVA_HOMES:-}" ]; then
+    for d in $EMUDHRA_JAVA_HOMES; do echo "$d"; done
+    return
+  fi
   [ -n "${JAVA_HOME:-}" ] && echo "$JAVA_HOME"
   p=$(command -v java 2>/dev/null)
   [ -n "$p" ] && dirname "$(dirname "$(resolve "$p")")"
@@ -692,7 +747,7 @@ audit_java() {
       [ -x "$jc" ] || continue
       if "$jc" --release 8 -d "$TMP/java-cls" "$TMP/java-src/EmudhraProbe.java" >/dev/null 2>&1 ||
          "$jc" -source 8 -target 8 -d "$TMP/java-cls" "$TMP/java-src/EmudhraProbe.java" >/dev/null 2>&1; then
-        compiled=1; log_cmd "$jc --release 8 -d <tmp> EmudhraProbe.java"; break
+        compiled=1; JAVA_PROBE_OK=1; log_cmd "$jc --release 8 -d <tmp> EmudhraProbe.java"; break
       fi
     done
   fi
@@ -843,6 +898,7 @@ fix_java() {
   if [ -n "$cac" ] && [ -x "$kt" ]; then
     n=$(java_affected_aliases "$kt" "$cac" | grep -c .)
     if [ "$n" -gt 0 ]; then
+      [ "${res%%:*}" = trusted ] && plan_add java "$h"
       fix "Stop-gap if no fixed build is available yet (this JDK's cacerts holds $n of the roots to distrust;"
       fix "the script has not tested that removing them stops the probe connecting):"
       fix "  R=\"$cac\"      # prefix commands with sudo if you cannot write to it"
@@ -1119,6 +1175,7 @@ audit_brew() {
   bundle="$prefix/etc/ca-certificates/cert.pem"
   if [ -f "$bundle" ]; then res=$(probe_cafile "$bundle"); else res="skipped:bundle $bundle not found"; fi
   if [ "${res%%:*}" = trusted ] || [ "$VC" = behind ]; then
+    plan_add brew "$prefix"
     fix "brew update && brew upgrade ca-certificates"
     fix "(Homebrew's Python, curl, openssl and others read this bundle. Old versions linger in the Cellar;"
     fix " 'brew cleanup ca-certificates' removes them.)"
@@ -1441,7 +1498,11 @@ print_guidance() {
   [ "$NO_GUIDE" -eq 1 ] && return 0
   [ -z "$GUIDE" ] && [ -z "$ADVISE" ] && return 0
   section "Remediation guidance"
-  echo "  This script only prints guidance; nothing below has been run. Commands that edit system trust"
+  if [ "$FIXMODE" -eq 1 ]; then
+    echo "  This is guidance only; nothing below has been run yet. Commands that edit system trust"
+  else
+    echo "  This is guidance only; nothing below has been run. Commands that edit system trust"
+  fi
   echo "  files need sudo - read them first. Upgrading is better than distrusting roots where it is possible."
   echo
   if [ -n "$GUIDE" ]; then
@@ -1454,7 +1515,493 @@ print_guidance() {
     printf '%s%sProtected today, but older than the fixed release - upgrade when convenient%s\n' "$C_BLD" "$C_YEL" "$C_OFF"
     printf '%s' "$ADVISE"
   fi
+  if [ "$FIXMODE" -eq 0 ] && [ "$PLAN" != $'\n' ]; then
+    echo "  This script can apply some of these for you (system CA bundle, Java cacerts, Homebrew, macOS pip):"
+    echo "    ${0##*/} --fix --dry-run    # verify and show every step, change nothing"
+    echo "    ${0##*/} --fix              # apply, asking before each change"
+    echo
+  fi
   echo "  After changing anything, re-run this script to confirm."
+  echo
+}
+
+# ------------------------------------------------------------------ fixing (--fix / --undo)
+#
+# Everything below only runs with --fix or --undo. Principles:
+#   * ask before every change (unless --yes); --dry-run changes nothing
+#   * build the new file/store on a COPY and test it before it replaces anything
+#   * keep a timestamped backup next to the original; --undo restores the newest one
+#   * re-run the probes afterwards and roll back if the result is not an improvement
+#   * never delete anything but the two roots named on the advisory page
+
+BACKUP_TAG=pre-emudhra
+STAMP=$(date +%Y%m%d%H%M%S)
+ROOTS_RE='(AAA Certificate Services|emSign ECC Root CA - G3)'
+SANITY_URLS="https://github.com/ https://www.google.com/ https://pypi.org/ https://repo.maven.apache.org/maven2/ https://registry.npmjs.org/ https://proxy.golang.org/"
+FIXED_N=0; FAILED_N=0; SKIPPED_N=0
+SUDO=
+FIX_NOTES=
+
+# fx_say / fx_do / fx_warn : consistent output for fix actions.
+fx_say()  { printf '  %s\n' "$*"; }
+fx_warn() { printf '  %s! %s%s\n' "$C_YEL" "$*" "$C_OFF"; }
+fx_ok()   { printf '  %s✓ %s%s\n' "$C_GRN" "$*" "$C_OFF"; }
+fx_bad()  { printf '  %s✗ %s%s\n' "$C_RED" "$*" "$C_OFF"; }
+fx_cmd()  { printf '  %s  $ %s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+
+# confirm PROMPT : y/N. --yes answers yes; no terminal means no.
+confirm() {
+  [ "$YES" -eq 1 ] && return 0
+  if [ ! -t 0 ]; then
+    fx_warn "no terminal to ask on - skipping (use --yes to run unattended)"
+    return 1
+  fi
+  local a
+  printf '  %s [y/N] ' "$1"
+  read -r a
+  case $a in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# need_sudo PATH : sets SUDO to "sudo" if PATH (or its directory) is not writable by us.
+need_sudo() {
+  local t=$1
+  [ -e "$t" ] || t=$(dirname "$t")
+  if [ -w "$t" ]; then SUDO=; else SUDO=sudo; fi
+  if [ "$SUDO" = sudo ] && [ "$(id -u)" -eq 0 ]; then SUDO=; fi
+  if [ "$SUDO" = sudo ] && ! command -v sudo >/dev/null 2>&1; then
+    fx_bad "need root to write $1 but sudo is not available - run this script as root"
+    return 1
+  fi
+  return 0
+}
+
+# as_root CMD... : run through $SUDO when needed (never in dry-run).
+as_root() {
+  fx_cmd "${SUDO:+$SUDO }$*"
+  [ "$DRY" -eq 1 ] && return 0
+  $SUDO "$@"
+}
+
+# strip_roots IN OUT : copy a PEM bundle without the two roots, leaving everything else verbatim.
+# Works per certificate: a block is the text since the previous END CERTIFICATE line, through its own
+# END CERTIFICATE line. That covers every common layout - Apple's "=== /C=../CN=.." headers with a
+# text dump, curl's "Name / =====" titles, and Mozilla-style "# comment" headers. A block is dropped
+# if any of its text (other than an Issuer: line) names one of the two roots.
+strip_roots() {
+  awk -v re="$ROOTS_RE" '
+    { buf = buf $0 "\n"; if ($0 !~ /Issuer/ && $0 ~ re) drop = 1 }
+    /^-----END CERTIFICATE-----/ { if (!drop) printf "%s", buf; buf = ""; drop = 0 }
+    END { printf "%s", buf }
+  ' "$1" > "$2"
+}
+
+# count_certs FILE
+count_certs() { local c; c=$(grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null); echo "${c:-0}"; }
+
+# bundle_roots_present FILE : prints how many of the two roots a PEM bundle still contains (via openssl).
+bundle_roots_present() {
+  local n=0 tmpd c
+  tmpd=$(mktemp -d "$TMP/pem.XXXXXX") || return 1
+  awk -v d="$tmpd" '/-----BEGIN CERTIFICATE-----/{i++; f=sprintf("%s/c%04d.pem", d, i)} f{print > f} /-----END CERTIFICATE-----/{close(f); f=""}' "$1"
+  for c in "$tmpd"/c*.pem; do
+    [ -f "$c" ] || continue
+    if openssl x509 -in "$c" -noout -subject 2>/dev/null | grep -Eq "$ROOTS_RE"; then n=$((n + 1)); fi
+  done
+  rm -rf "$tmpd"
+  echo "$n"
+}
+
+# sanity_check_bundle FILE : does a bundle still validate the normal sites? Uses the Python probe
+# against SANITY_URLS (with FILE as the only trust anchors) and the compromised hosts.
+# Prints "sane" or "broken:<url>"; prints "unchecked:<why>" if it cannot be tested.
+sanity_check_bundle() {
+  local f=$1 out r u ok=0 bad
+  [ -n "$PYBIN" ] || { echo "unchecked:no Python available"; return; }
+  out=$("$PYBIN" -I "$TMP/py_probe.py" cafile "$f" $SANITY_URLS 2>/dev/null </dev/null)
+  while read -r r u; do
+    case $r in ok) ok=$((ok + 1)) ;; certerr) bad="${bad:+$bad }$u" ;; esac
+  done <<EOF
+$out
+EOF
+  if [ -n "$bad" ]; then echo "broken:$bad"; return; fi
+  if [ "$ok" -eq 0 ]; then echo "unchecked:could not reach the sanity-check sites"; return; fi
+  echo sane
+}
+
+# verdict_for_bundle FILE : trusted | rejected | inconclusive:... for the compromised hosts.
+verdict_for_bundle() { probe_cafile "$1"; }
+
+# newest_backup FILE : most recent FILE.pre-emudhra-* (empty if none)
+newest_backup() { ls -1t "$1".$BACKUP_TAG-* 2>/dev/null | head -1; }
+
+# ---- shared: patch a PEM bundle in place (macOS /etc/ssl/cert.pem and similar single-file stores)
+fix_pem_bundle() {
+  local f=$1 new="$TMP/patched-bundle.pem" before after bak st v
+  fx_say "${C_BLD}$f${C_OFF}  (system CA bundle: read by the built-in curl, git, python3, perl, openssl)"
+  if [ ! -f "$f" ]; then fx_warn "not found"; SKIPPED_N=$((SKIPPED_N + 1)); return; fi
+  before=$(count_certs "$f")
+  strip_roots "$f" "$new"
+  after=$(count_certs "$new")
+  if [ "$after" -ge "$before" ]; then
+    fx_ok "already clean - neither root is present ($before certificates)"; SKIPPED_N=$((SKIPPED_N + 1)); return
+  fi
+  if [ $((before - after)) -gt 2 ]; then
+    fx_bad "refusing: stripping would remove $((before - after)) certificates; expected at most 2"
+    FAILED_N=$((FAILED_N + 1)); return
+  fi
+  fx_say "would remove $((before - after)) of $before certificates (the two roots only)"
+  v=$(verdict_for_bundle "$new")
+  case ${v%%:*} in
+    rejected)    fx_ok "test on a copy: the patched bundle rejects the compromised chain" ;;
+    trusted)     fx_bad "test on a copy: the patched bundle STILL accepts the compromised chain - not applying"
+                 FAILED_N=$((FAILED_N + 1)); return ;;
+    *)           fx_bad "could not test the patched copy (${v#*:}) - not applying a change I cannot verify"
+                 FAILED_N=$((FAILED_N + 1)); return ;;
+  esac
+  st=$(sanity_check_bundle "$new")
+  case ${st%%:*} in
+    sane)      fx_ok "test on a copy: github.com, google.com, pypi.org, Maven Central, npm and the Go proxy still validate" ;;
+    broken)    fx_bad "the patched bundle would break: ${st#broken:} - not applying"
+               fx_say "(those sites chain to a root this fix removes; use the vendor package update instead)"
+               FAILED_N=$((FAILED_N + 1)); return ;;
+    *)         fx_bad "sanity check could not run (${st#*:}) - not applying a change I cannot verify"
+               FAILED_N=$((FAILED_N + 1)); return ;;
+  esac
+  fx_warn "side effect: any site whose certificate chains to either root will stop validating in tools that use this bundle"
+  if [ "$DRY" -eq 1 ]; then
+    fx_say "[dry-run] would back up to $f.$BACKUP_TAG-$STAMP and install the patched bundle"
+    need_sudo "$f" >/dev/null 2>&1 || true
+    fx_cmd "${SUDO:+$SUDO }cp -p $f $f.$BACKUP_TAG-$STAMP"
+    fx_cmd "${SUDO:+$SUDO }cp $new $f   # keeps owner/mode of the original"
+    return
+  fi
+  confirm "Remove the two roots from $f?" || { fx_say "skipped"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  need_sudo "$f" || { FAILED_N=$((FAILED_N + 1)); return; }
+  bak="$f.$BACKUP_TAG-$STAMP"
+  as_root cp -p "$f" "$bak" || { fx_bad "backup failed - nothing changed"; FAILED_N=$((FAILED_N + 1)); return; }
+  # write through the original inode's permissions: cp over the file keeps owner and mode
+  as_root cp "$new" "$f" || { fx_bad "install failed - restoring"; as_root cp -p "$bak" "$f"; FAILED_N=$((FAILED_N + 1)); return; }
+  v=$(verdict_for_bundle "$f")
+  case ${v%%:*} in
+    rejected) fx_ok "verified: $f now rejects the compromised chain"
+              FIXED_N=$((FIXED_N + 1))
+              FIX_NOTES="${FIX_NOTES}  - $f: backup at $bak"$'\n' ;;
+    *)        fx_bad "verification failed (${v}) - rolling back"
+              as_root cp -p "$bak" "$f"
+              FAILED_N=$((FAILED_N + 1)) ;;
+  esac
+}
+
+# ---- Debian / Ubuntu / Alpine : mark the roots as disabled in ca-certificates.conf
+fix_debian_like() {
+  local conf=/etc/ca-certificates.conf new="$TMP/ca-certificates.conf" bak changed
+  fx_say "${C_BLD}$conf${C_OFF}  (Debian/Ubuntu/Alpine CA configuration)"
+  [ -f "$conf" ] || { fx_warn "not found"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  if ! command -v update-ca-certificates >/dev/null 2>&1; then
+    fx_warn "update-ca-certificates not found - cannot rebuild the bundle"; SKIPPED_N=$((SKIPPED_N + 1)); return
+  fi
+  sed -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' "$conf" > "$new"
+  if cmp -s "$conf" "$new"; then
+    fx_ok "already clean - both roots are already disabled (or not listed)"; SKIPPED_N=$((SKIPPED_N + 1)); return
+  fi
+  fx_say "would disable: $(diff "$conf" "$new" | sed -n 's/^> !//p' | tr '\n' ' ')"
+  if [ "$DRY" -eq 1 ]; then
+    fx_say "[dry-run] would back up to $conf.$BACKUP_TAG-$STAMP, install the edited file and run update-ca-certificates"
+    need_sudo "$conf" >/dev/null 2>&1 || true
+    fx_cmd "${SUDO:+$SUDO }cp -p $conf $conf.$BACKUP_TAG-$STAMP"
+    fx_cmd "${SUDO:+$SUDO }cp $new $conf && ${SUDO:+$SUDO }update-ca-certificates"
+    return
+  fi
+  confirm "Disable the two roots in $conf and rebuild the bundle?" || { fx_say "skipped"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  need_sudo "$conf" || { FAILED_N=$((FAILED_N + 1)); return; }
+  bak="$conf.$BACKUP_TAG-$STAMP"
+  as_root cp -p "$conf" "$bak" || { fx_bad "backup failed - nothing changed"; FAILED_N=$((FAILED_N + 1)); return; }
+  as_root cp "$new" "$conf" && as_root update-ca-certificates >/dev/null
+  changed=$(for b in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem; do [ -f "$b" ] && { probe_cafile "$b"; break; }; done)
+  case ${changed%%:*} in
+    rejected) fx_ok "verified: the rebuilt system bundle rejects the compromised chain"
+              FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - $conf: backup at $bak (restore with --undo)"$'\n' ;;
+    *)        fx_bad "verification failed (${changed:-no result}) - rolling back"
+              as_root cp -p "$bak" "$conf" && as_root update-ca-certificates >/dev/null
+              FAILED_N=$((FAILED_N + 1)) ;;
+  esac
+}
+
+# ---- Fedora/RHEL/SUSE/Arch : add the roots to the p11-kit blocklist
+fix_p11_blocklist() {
+  local d bundle
+  fx_say "${C_BLD}p11-kit blocklist${C_OFF}  (Fedora/RHEL/SUSE/Arch)"
+  command -v trust >/dev/null 2>&1 || { fx_warn "'trust' command not found"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  if [ -d /etc/pki/ca-trust/source ]; then d=/etc/pki/ca-trust/source/blocklist; [ -d $d ] || d=/etc/pki/ca-trust/source/blacklist
+  elif [ -d /etc/pki/trust ]; then d=/etc/pki/trust/blocklist; [ -d $d ] || d=/etc/pki/trust/blacklist
+  elif [ -d /etc/ca-certificates/trust-source ]; then d=/etc/ca-certificates/trust-source/blocklist
+  else fx_warn "no known trust-source directory"; SKIPPED_N=$((SKIPPED_N + 1)); return; fi
+  if [ -f "$d/emSign_ECC_Root_CA_-_G3.pem" ]; then fx_ok "already clean - blocklist entry exists in $d"; SKIPPED_N=$((SKIPPED_N + 1)); return; fi
+  fx_say "would add blocklist entries to $d (new files; nothing existing is modified)"
+  if [ "$DRY" -eq 1 ]; then
+    need_sudo "$d" >/dev/null 2>&1 || true
+    fx_cmd "${SUDO:+$SUDO }trust extract --format=pem-bundle --filter='pkcs11:object=emSign%20ECC%20Root%20CA%20-%20G3;type=cert' $d/emSign_ECC_Root_CA_-_G3.pem"
+    fx_cmd "${SUDO:+$SUDO }trust extract --format=pem-bundle --filter='pkcs11:object=Comodo%20AAA%20Services%20root;type=cert' $d/Comodo_AAA_Services_root.pem"
+    fx_cmd "${SUDO:+$SUDO }update-ca-trust   # or update-ca-certificates on SUSE"
+    return
+  fi
+  confirm "Add the two roots to the trust blocklist in $d?" || { fx_say "skipped"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  need_sudo "$d" || { FAILED_N=$((FAILED_N + 1)); return; }
+  as_root mkdir -p "$d"
+  as_root trust extract --overwrite --format=pem-bundle --filter='pkcs11:object=emSign%20ECC%20Root%20CA%20-%20G3;type=cert' "$d/emSign_ECC_Root_CA_-_G3.pem"
+  as_root trust extract --overwrite --format=pem-bundle --filter='pkcs11:object=Comodo%20AAA%20Services%20root;type=cert' "$d/Comodo_AAA_Services_root.pem"
+  if command -v update-ca-trust >/dev/null 2>&1; then as_root update-ca-trust; else as_root update-ca-certificates; fi
+  for bundle in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/certs/ca-certificates.crt; do
+    [ -f "$bundle" ] && break
+  done
+  v=$(probe_cafile "$bundle")
+  case ${v%%:*} in
+    rejected) fx_ok "verified: the rebuilt bundle rejects the compromised chain"
+              FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - blocklist files in $d (remove them and re-run update-ca-trust to undo)"$'\n' ;;
+    *)        fx_bad "verification failed (${v:-no result}) - removing the blocklist entries"
+              as_root rm -f "$d/emSign_ECC_Root_CA_-_G3.pem" "$d/Comodo_AAA_Services_root.pem"
+              if command -v update-ca-trust >/dev/null 2>&1; then as_root update-ca-trust; else as_root update-ca-certificates; fi
+              FAILED_N=$((FAILED_N + 1)) ;;
+  esac
+}
+
+# ---- what the system fix should do on this platform
+fix_system() {
+  local id= like= all
+  [ -r /etc/os-release ] && { id=$(. /etc/os-release; echo "$ID"); like=$(. /etc/os-release; echo "$ID_LIKE"); }
+  all="$id $like $(uname -s)"
+  echo
+  fx_say "${C_BLD}System trust store${C_OFF}"
+  if [ "$WORKAROUND_ONLY" -eq 0 ]; then
+    case $all in
+      *debian*|*ubuntu*|*alpine*|*devuan*) fx_say "Preferred: the vendor's fixed package (apt-get install --only-upgrade ca-certificates / apk upgrade ca-certificates)." ;;
+      *fedora*|*rhel*|*centos*|*rocky*|*almalinux*|*amzn*) fx_say "Preferred: the vendor's fixed package (dnf upgrade ca-certificates)." ;;
+    esac
+  fi
+  case $all in
+    *Darwin*)                                    fix_pem_bundle /etc/ssl/cert.pem ;;
+    *debian*|*ubuntu*|*alpine*|*devuan*)         fix_debian_like ;;
+    *fedora*|*rhel*|*centos*|*rocky*|*almalinux*|*amzn*|*suse*|*sles*|*arch*) fix_p11_blocklist ;;
+    *)  fx_warn "no automated fix for this platform ($all) - follow the printed guidance"; SKIPPED_N=$((SKIPPED_N + 1)) ;;
+  esac
+}
+
+# ---- Java cacerts
+# java_alias_subject KEYTOOL CACERTS ALIAS : the certificate's CN, for display only.
+java_alias_subject() {
+  "$1" -J-Duser.language=en -list -v -keystore "$2" -storepass changeit -alias "$3" 2>/dev/null </dev/null |
+    sed -n 's/^Owner:.*CN=\([^,]*\).*/\1/p' | head -1
+}
+
+fix_java_store() {
+  local h=$1 cac kt n aliases a work bak v pre
+  fx_say ""
+  fx_say "${C_BLD}Java cacerts${C_OFF}  $h"
+  cac=$(java_cacerts "$h"); kt=$h/bin/keytool
+  if [ -z "$cac" ] || [ ! -x "$kt" ]; then fx_warn "no cacerts or keytool - skipped"; SKIPPED_N=$((SKIPPED_N + 1)); return; fi
+  aliases=$(java_affected_aliases "$kt" "$cac")
+  n=$(printf '%s\n' "$aliases" | grep -c .)
+  if [ "$n" -eq 0 ]; then fx_ok "none of the roots are in $cac"; SKIPPED_N=$((SKIPPED_N + 1)); return; fi
+  fx_say "this is a stop-gap: upgrading to a fixed JDK is better, and restores these roots"
+  fx_say "would delete $n entr$([ "$n" -eq 1 ] && echo y || echo ies) from the JDK trust store ($cac):"
+  printf '%s\n' "$aliases" | while IFS= read -r a; do
+    [ -n "$a" ] && printf '      %s   (%s)\n' "$a" "$(java_alias_subject "$kt" "$cac" "$a")"
+  done
+  work="$TMP/cacerts.$$"
+  cp "$cac" "$work"
+  printf '%s\n' "$aliases" | while IFS= read -r a; do
+    [ -n "$a" ] && "$kt" -delete -alias "$a" -keystore "$work" -storepass changeit >/dev/null 2>&1
+  done
+  pre=$("$kt" -list -keystore "$cac" -storepass changeit 2>/dev/null | grep -c trustedCertEntry)
+  if [ "$(java_affected_aliases "$kt" "$work" | grep -c .)" -ne 0 ]; then
+    fx_bad "test on a copy: the roots are still present after deletion - not applying"; FAILED_N=$((FAILED_N + 1)); return
+  fi
+  if [ $((pre - $("$kt" -list -keystore "$work" -storepass changeit 2>/dev/null | grep -c trustedCertEntry))) -ne "$n" ]; then
+    fx_bad "test on a copy: removed a different number of entries than planned - not applying"; FAILED_N=$((FAILED_N + 1)); return
+  fi
+  v=$(java_probe_with_store "$h" "$work")
+  case ${v%%:*} in
+    rejected) fx_ok "test on a copy: this JDK rejects the compromised chain with the patched store" ;;
+    trusted)  fx_bad "test on a copy: the JDK STILL accepts the chain with the patched store - not applying"
+              fx_say "(the chain may be accepted through a different root; the fixed JDK build is the real answer)"
+              FAILED_N=$((FAILED_N + 1)); return ;;
+    *)        fx_warn "could not test the patched copy (${v#*:})" ;;
+  esac
+  if [ "$DRY" -eq 1 ]; then
+    need_sudo "$cac" >/dev/null 2>&1 || true
+    fx_say "[dry-run] would back up to $cac.$BACKUP_TAG-$STAMP and install the patched store"
+    fx_cmd "${SUDO:+$SUDO }cp -p $cac $cac.$BACKUP_TAG-$STAMP"
+    fx_cmd "${SUDO:+$SUDO }cp $work $cac"
+    return
+  fi
+  confirm "Remove these $n entries from $cac?" || { fx_say "skipped"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  need_sudo "$cac" || { FAILED_N=$((FAILED_N + 1)); return; }
+  bak="$cac.$BACKUP_TAG-$STAMP"
+  as_root cp -p "$cac" "$bak" || { fx_bad "backup failed - nothing changed"; FAILED_N=$((FAILED_N + 1)); return; }
+  as_root cp "$work" "$cac" || { as_root cp -p "$bak" "$cac"; FAILED_N=$((FAILED_N + 1)); return; }
+  v=$(java_probe_with_store "$h" "")
+  case ${v%%:*} in
+    rejected) fx_ok "verified: this JDK now rejects the compromised chain"
+              FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - $cac: backup at $bak (a JDK upgrade also restores the roots)"$'\n' ;;
+    *)        fx_bad "verification failed (${v}) - rolling back"; as_root cp -p "$bak" "$cac"; FAILED_N=$((FAILED_N + 1)) ;;
+  esac
+  rm -f "$work"
+}
+
+# java_probe_with_store JAVA_HOME STORE : run the compiled probe, optionally against a different truststore.
+java_probe_with_store() {
+  local h=$1 store=$2 out opts=
+  [ "$JAVA_PROBE_OK" -eq 1 ] || { echo "inconclusive:no javac available to build the probe"; return; }
+  [ -n "$store" ] && opts="-Djavax.net.ssl.trustStore=$store -Djavax.net.ssl.trustStorePassword=changeit"
+  out=$("$h/bin/java" $opts -cp "$TMP/java-cls" EmudhraProbe $CONTROL_URL $BAD_URLS 2>/dev/null </dev/null)
+  printf '%s\n' "$out" | judge
+}
+
+# ---- Homebrew
+fix_brew_store() {
+  local prefix=$1 b="$1/bin/brew" before after v
+  echo
+  fx_say "${C_BLD}Homebrew ca-certificates${C_OFF}"
+  [ -x "$b" ] || b=$(command -v brew)
+  before=$(basename "$(readlink "$prefix/opt/ca-certificates" 2>/dev/null)")
+  fx_say "installed: $before; fixed in 2026-09-25_1 (this is an upgrade, not a trust-store edit)"
+  if [ "$DRY" -eq 1 ]; then
+    fx_cmd "$b update && $b upgrade ca-certificates"
+    return
+  fi
+  confirm "Run 'brew update && brew upgrade ca-certificates'?" || { fx_say "skipped"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  fx_cmd "$b update"; "$b" update >/dev/null 2>&1 </dev/null || fx_warn "brew update reported a problem; continuing"
+  fx_cmd "$b upgrade ca-certificates"; "$b" upgrade ca-certificates </dev/null 2>&1 | sed 's/^/      /' | tail -5
+  after=$(basename "$(readlink "$prefix/opt/ca-certificates" 2>/dev/null)")
+  v=$(probe_cafile "$prefix/etc/ca-certificates/cert.pem")
+  case ${v%%:*} in
+    rejected) fx_ok "verified: Homebrew's bundle ($after) now rejects the compromised chain"
+              FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - Homebrew ca-certificates: $before -> $after (brew cleanup removes the old version)"$'\n' ;;
+    *)        fx_bad "after upgrade, Homebrew's bundle still does not reject the chain (${v:-no result}); installed: $after"
+              FAILED_N=$((FAILED_N + 1)) ;;
+  esac
+}
+
+# ---- macOS built-in pip (sitecustomize.py sets PIP_CERT)
+fix_macos_pip() {
+  local py=/usr/bin/python3 f d line bak
+  echo
+  fx_say "${C_BLD}macOS built-in pip${C_OFF}  (/usr/bin/python3)"
+  [ -x "$py" ] || { fx_warn "not found"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  d=$("$py" -c 'import sysconfig; print(sysconfig.get_path("stdlib"))' 2>/dev/null </dev/null)
+  [ -n "$d" ] && [ -d "$d" ] || { fx_warn "could not locate the stdlib directory"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  f="$d/sitecustomize.py"
+  line='import os; os.environ.setdefault("PIP_CERT", "/etc/ssl/cert.pem")'
+  if [ -f "$f" ] && grep -qF "$line" "$f"; then fx_ok "already configured in $f"; SKIPPED_N=$((SKIPPED_N + 1)); return; fi
+  fx_say "this points Apple's pip at /etc/ssl/cert.pem, so it only helps once that file is patched"
+  case $d in
+    */Xcode.app/*|*/CommandLineTools/*)
+      fx_warn "this directory is inside $(case $d in */Xcode.app/*) echo Xcode;; *) echo the Command Line Tools;; esac): updating it will overwrite this change. A virtualenv or Homebrew Python avoids that." ;;
+  esac
+  fx_say "would append one line to $f (new file if absent)"
+  if [ "$DRY" -eq 1 ]; then
+    need_sudo "$d" >/dev/null 2>&1 || true
+    [ -f "$f" ] && fx_cmd "${SUDO:+$SUDO }cp -p $f $f.$BACKUP_TAG-$STAMP"
+    fx_cmd "echo '$line' | ${SUDO:+$SUDO }tee -a $f"
+    return
+  fi
+  confirm "Add that line to $f?" || { fx_say "skipped"; SKIPPED_N=$((SKIPPED_N + 1)); return; }
+  need_sudo "$d" || { FAILED_N=$((FAILED_N + 1)); return; }
+  bak=
+  if [ -f "$f" ]; then bak="$f.$BACKUP_TAG-$STAMP"; as_root cp -p "$f" "$bak" || { FAILED_N=$((FAILED_N + 1)); return; }; fi
+  fx_cmd "echo '...' | ${SUDO:+$SUDO }tee -a $f"
+  printf '%s\n' "$line" | $SUDO tee -a "$f" >/dev/null && $SUDO chmod 644 "$f"
+  if "$py" -I -c 'import sys' >/dev/null 2>&1 </dev/null; then
+    fx_ok "applied; $py still starts. Re-run the audit to see pip's result."
+    FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - $f: ${bak:+backup at $bak, }created or appended (delete the line to undo)"$'\n'
+  else
+    fx_bad "$py no longer starts - rolling back"
+    if [ -n "$bak" ]; then as_root cp -p "$bak" "$f"; else as_root rm -f "$f"; fi
+    FAILED_N=$((FAILED_N + 1))
+  fi
+}
+
+# ---- orchestration
+run_fixes() {
+  local line kind target ran=0
+  section "Fix"
+  if [ "$PLAN" = $'\n' ]; then
+    echo "  Nothing to fix: no affected item has an automated fix."; echo; return 0
+  fi
+  if [ "$DRY" -eq 1 ]; then
+    echo "  DRY RUN - nothing will be changed. Each step below is verified on a copy where possible."
+  else
+    echo "  Each change asks first, is tested on a copy, is backed up, verified after, and rolled back if it fails."
+  fi
+  if [ "$(uname)" = Darwin ] && profiles status -type enrollment 2>/dev/null </dev/null | grep -qi 'enrolled via DEP: *Yes\|MDM enrollment: *Yes'; then
+    fx_warn "this Mac appears to be enrolled in MDM ($(profiles status -type enrollment 2>/dev/null </dev/null | tr '\n' ' ' | cut -c1-110)): IT may overwrite these changes, or want to make them centrally"
+  fi
+  # order: package/upgrade fixes first, then the system store, then the stop-gaps that depend on it
+  for kind in brew sys java macpip; do
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      case $line in "$kind|"*) ;; *) continue ;; esac
+      target=${line#*|}
+      [ -n "$ONLY" ] && [ "$ONLY" != "$kind" ] && continue
+      ran=1
+      case $kind in
+        brew)   fix_brew_store "$target" ;;
+        sys)    fix_system ;;
+        java)   fix_java_store "$target" ;;
+        macpip) fix_macos_pip ;;
+      esac
+    done <<EOF
+$PLAN
+EOF
+  done
+  echo
+  [ "$ran" -eq 0 ] && echo "  Nothing matched${ONLY:+ --only $ONLY}."
+  printf '  %sChanged: %s   Failed or refused: %s   Skipped: %s%s\n' "$C_BLD" "$FIXED_N" "$FAILED_N" "$SKIPPED_N" "$C_OFF"
+  if [ -n "$FIX_NOTES" ]; then
+    echo "  Backups and undo notes:"
+    printf '%s' "$FIX_NOTES"
+    echo "  Restore system files and JDK stores with: ${0##*/} --undo"
+  fi
+  if [ "$DRY" -eq 0 ] && [ "$FIXED_N" -gt 0 ]; then
+    echo "  Re-run the audit to confirm. OS updates may overwrite edited system files."
+  fi
+  echo
+}
+
+# ---- undo
+run_undo() {
+  local f b any=0 cands h d
+  section "Undo"
+  cands=$(
+    for f in /etc/ssl/cert.pem /etc/ca-certificates.conf /etc/pki/tls/certs/ca-bundle.crt; do
+      [ -n "$(newest_backup "$f")" ] && echo "$f"
+    done
+    # every JDK the audit would find, so backups are found wherever the JDK lives
+    for h in $(java_candidates | awk '!s[$0]++'); do
+      f=$(java_cacerts "$h")
+      [ -n "$f" ] && [ -n "$(newest_backup "$f")" ] && echo "$f"
+    done
+    if [ "$(uname)" = Darwin ] && [ -x /usr/bin/python3 ]; then
+      d=$(/usr/bin/python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))' 2>/dev/null </dev/null)
+      [ -n "$d" ] && [ -n "$(newest_backup "$d/sitecustomize.py")" ] && echo "$d/sitecustomize.py"
+    fi
+  )
+  for f in $(printf '%s\n' "$cands" | awk '!s[$0]++'); do
+    b=$(newest_backup "$f")
+    [ -z "$b" ] && continue
+    any=1
+    fx_say "${C_BLD}$f${C_OFF}"
+    fx_say "restore from $b"
+    if [ "$DRY" -eq 1 ]; then fx_say "[dry-run] would restore it"; continue; fi
+    confirm "Restore $f from that backup?" || { fx_say "skipped"; continue; }
+    need_sudo "$f" || continue
+    if as_root cp -p "$b" "$f"; then fx_ok "restored"; else fx_bad "restore failed"; continue; fi
+    case $f in
+      /etc/ca-certificates.conf) command -v update-ca-certificates >/dev/null 2>&1 && as_root update-ca-certificates >/dev/null ;;
+    esac
+  done
+  [ "$any" -eq 0 ] && echo "  No ${BACKUP_TAG} backups found in the usual places."
+  echo "  Homebrew upgrades and p11-kit blocklist files are not covered by --undo (see the notes printed by --fix)."
   echo
 }
 
@@ -1469,6 +2016,11 @@ else
   echo "Probe hosts: $BAD_URLS (control: $CONTROL_URL)"
 fi
 echo
+
+if [ "$UNDO" -eq 1 ]; then
+  run_undo
+  exit 0
+fi
 
 audit_env
 audit_curl
@@ -1498,6 +2050,10 @@ echo "Elixir/Erlang, containers and per-project virtualenvs/node_modules."
 echo
 
 print_guidance
+
+if [ "$FIXMODE" -eq 1 ]; then
+  run_fixes
+fi
 
 [ "$N_BAD" -gt 0 ] && exit 1
 exit 0

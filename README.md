@@ -18,8 +18,10 @@
 
 # eMudhra Dev Tools Audit
 
-`emudhra-audit.sh` is a read-only audit script that checks the developer tools installed on a machine against the
-[eMudhra intermediate CA compromise](https://emudhra.we-have-a-problem.com/), and prints guidance for fixing anything affected.
+`emudhra-audit.sh` checks the developer tools installed on a machine against the
+[eMudhra intermediate CA compromise](https://emudhra.we-have-a-problem.com/), and prints guidance for fixing anything
+affected. By default it is **read-only**. With `--fix` it can also apply the fixes it knows about, one confirmed change at
+a time, with backups and automatic rollback.
 
 ## Contents
 
@@ -30,6 +32,7 @@
 - [Reading the output](#reading-the-output)
 - [Options and exit codes](#options-and-exit-codes)
 - [Remediation guidance](#remediation-guidance)
+- [Applying fixes (`--fix`)](#applying-fixes---fix)
 - [Requirements and portability](#requirements-and-portability)
 - [Safety](#safety)
 - [Limitations](#limitations)
@@ -56,6 +59,7 @@ that page as of 2026-10-22; check the page for updates.
 ./emudhra-audit.sh              # full audit with live TLS probes and guidance
 ./emudhra-audit.sh --no-network # version checks only (no connections)
 ./emudhra-audit.sh --verbose    # also show the probe commands and raw TLS errors
+./emudhra-audit.sh --fix --dry-run  # show exactly what a fix would do; change nothing
 ```
 
 No installation is needed. The script is a single file; make it executable with `chmod +x emudhra-audit.sh` if required.
@@ -65,7 +69,7 @@ No installation is needed. The script is a single file; make it executable with 
 For each tool it finds, the script runs up to two checks.
 
 1. **Live probe (authoritative).** The tool itself connects to two hosts that chain to the compromised intermediates, plus
-   a control host (`https://example.com/`).
+   a control host (`https://github.com/`, chosen because it does not depend on either root the page says to distrust).
    - A TLS certificate error on the test hosts means the tool **rejects** the chain: protected.
    - A successful connection means the tool **trusts** the chain: affected.
    - If the control host also fails, the result is "inconclusive". This catches tools with no CA bundle, a proxy that
@@ -138,6 +142,12 @@ At the end there is a summary count, followed by the remediation guidance.
 | `--no-network` | Skip live probes and make no connections. Items that need a probe to resolve are reported as unknown. |
 | `--no-guidance` | Do not print remediation guidance. |
 | `--verbose` | Print each probe command and the raw TLS errors. |
+| `--fix` | After the audit, offer to apply fixes, asking before each change. See [Applying fixes](#applying-fixes---fix). |
+| `--dry-run` | With `--fix`: run every check and show every step, but change nothing. |
+| `--yes` | With `--fix` or `--undo`: do not ask before each change (for unattended use). |
+| `--only=KIND` | With `--fix`: apply one kind of fix only: `brew`, `sys`, `java` or `macpip`. |
+| `--workaround-only` | With `--fix`: skip mention of the vendor package upgrade on Linux. |
+| `--undo` | Restore the backups made by `--fix`. |
 | `-h`, `--help` | Show usage. |
 
 | Exit code | Meaning |
@@ -169,35 +179,93 @@ If no fixed JDK build is available yet, the guidance for a Java install also pri
 `cacerts` and delete the entries for the two roots. It is untested as a fix, makes Java reject sites chained to those
 roots, and is undone by a JDK upgrade or by restoring the backup.
 
-**The script never runs any of this guidance.** It only prints it. Read each command before running it; the trust-store
-commands need `sudo`.
+**Without `--fix` the script never runs any of this guidance.** It only prints it. Read each command before running it; the
+trust-store commands need `sudo`.
 
 After changing anything, run the script again to confirm.
+
+## Applying fixes (`--fix`)
+
+`--fix` changes the machine, so read this section before using it. **Prefer upgrading** the affected tool where a fixed
+release exists; the fixes here distrust two roots, which has side effects.
+
+### What it can fix
+
+| Kind (`--only=`) | What it does | Needs sudo |
+|---|---|---|
+| `brew` | `brew update && brew upgrade ca-certificates` (an upgrade, not a trust-store edit). | no |
+| `sys` | Removes the two roots from the system CA bundle: `/etc/ssl/cert.pem` on macOS; `ca-certificates.conf` plus `update-ca-certificates` on Debian, Ubuntu and Alpine; the p11-kit blocklist on Fedora, RHEL, SUSE and Arch. | yes |
+| `java` | Deletes the two roots from a JDK's `cacerts`. A **stop-gap** for JDKs with no fixed build; a JDK upgrade restores them. | if the JDK is not yours |
+| `macpip` | Appends the page's `PIP_CERT` line to Apple's Python `sitecustomize.py`. | yes |
+
+The two roots are `AAA Certificate Services` (Comodo/Sectigo) and `emSign ECC Root CA - G3`. Nothing else is removed. The
+script refuses to proceed if a change would remove more than expected.
+
+### Safeguards
+
+Each change follows the same sequence:
+
+1. The new file or store is built on a **copy** first.
+2. The copy is **tested**: it must reject the compromised chain, and it must still validate GitHub, Google, PyPI, Maven
+   Central, npm and the Go module proxy. If a normal site would break, the change is refused.
+3. You are **asked** (`--yes` skips this; with no terminal and no `--yes` nothing is changed).
+4. The original is **backed up** next to itself as `<file>.pre-emudhra-<timestamp>`.
+5. The change is installed, then the tool is **probed again**. If it does not reject the chain, the backup is restored
+   automatically.
+
+`--dry-run` stops before step 3 and prints the exact commands. `--undo` restores the newest backup for each store it
+finds. Homebrew upgrades and p11-kit blocklist files are not covered by `--undo`; the notes printed after `--fix` say how
+to reverse them.
+
+### Side effects you should expect
+
+- **Sites that chain to either root stop validating** in tools using the patched store. This is real: `example.com`
+  currently chains to `AAA Certificate Services`. Check anything you depend on, such as internal or partner sites.
+- **Updates can undo the change.** An OS update may replace `/etc/ssl/cert.pem`; a JDK upgrade restores the roots; an
+  Xcode update replaces Apple's Python directory. Re-run the audit after updating.
+- **Managed devices.** On a Mac enrolled in MDM the script warns you: IT may overwrite these edits or want to apply them
+  centrally. The page does not recommend the Windows equivalent for enterprise-managed devices, and the same caution
+  applies here.
+- **It cannot patch what it cannot see**: Electron apps, bundled runtimes, containers and CI images need their own updates.
+
+### What has been tested
+
+| Path | Status |
+|---|---|
+| Root-stripping on a real macOS bundle (`tests/test_strip_roots.sh`) | Tested: exactly the two roots removed, all others unchanged by SHA-256. |
+| Java `cacerts` fix, verify, idempotence, `--undo` and rollback | Tested end to end on a throwaway JDK copy. Restoring gave a byte-identical file. |
+| `--dry-run` for `sys`, `java`, `brew` and `macpip` on macOS | Tested. |
+| `--yes` validation, no-terminal behaviour, bad flags | Tested. |
+| The macOS system-bundle edit itself (needs sudo), `brew` upgrade, `macpip` | **Not applied for real** in testing. Dry run only. |
+| Debian, Ubuntu, Alpine, Fedora, RHEL, SUSE and Arch fixes | **Not tested.** The code follows the page's recipes but has not been run. |
+
+Run the dry run first on any machine, and expect to read what it prints.
 
 ## Requirements and portability
 
 - Bash 3.2 or later, which includes the stock macOS shell. The script avoids newer Bash features.
 - Standard tools: `awk`, `sed`, `grep`, `readlink`, `mktemp`.
-- Network access to `*.we-have-a-problem.com` and `example.com` for live probes. Use `--no-network` if that is not allowed.
+- Network access to `*.we-have-a-problem.com` and `github.com` for live probes. Use `--no-network` if that is not allowed.
 - For the full set of probes, the relevant runtime must be installed. The script uses each tool's own runtime to test
   itself, so it does not need `jq` or any other extra dependency.
   - Java probes need a `javac` somewhere on the machine to compile the probe once. Without one, Java installs are
     checked by version only.
   - Testing CA bundle files and Homebrew's bundle uses a Python 3.8 or later interpreter found by the audit.
 
-Tested on macOS (Apple silicon) with Bash 3.2. The Linux and BSD code paths (package checks and per-distribution guidance)
-have **not** been exercised yet. The macOS workaround edits `/etc/ssl/cert.pem`; reports differ on whether macOS updates
+Tested on macOS (Apple silicon) with Bash 3.2. The Linux and BSD code paths (package checks, per-distribution guidance and
+the `--fix` recipes) have **not** been exercised yet. The macOS workaround edits `/etc/ssl/cert.pem`; reports differ on whether macOS updates
 refresh that file, so re-run the audit after updating rather than assuming.
 
 ## Safety
 
-- The script is read-only. It does not install, change or delete anything on the machine.
+- Without `--fix` the script is read-only. It does not install, change or delete anything on the machine. See
+  [Applying fixes](#applying-fixes---fix) for what `--fix` does.
 - It writes small probe programs (Python, Go, Java, Node.js, Deno, Bun) into a private temporary directory and removes it
   on exit. Go probes run with `GOTOOLCHAIN=local` so Go does not download another toolchain, and Python runs in isolated
   mode (`-I`).
-- Live probes make ordinary HTTPS requests to the two test hosts published on the reference page and to `example.com`.
+- Live probes make ordinary HTTPS requests to the two test hosts published on the reference page and to `github.com`.
   Nothing is sent beyond a normal `GET /`.
-- Guidance is text only.
+- Without `--fix`, guidance is text only.
 
 ## Limitations
 
