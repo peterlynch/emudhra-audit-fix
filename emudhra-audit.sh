@@ -3,7 +3,7 @@
 # emudhra-audit.sh - read-only audit of developer tools against the eMudhra
 # intermediate CA compromise: https://emudhra.we-have-a-problem.com/
 #
-# Covers curl, Go, Python, Java, Node.js, Deno, Bun, rustup, uv, pixi, mise,
+# Covers curl, git, Go, Python (incl. pip), Java, Node.js, Deno, Bun, rustup, uv, pixi, mise,
 # Claude Code, Electron apps, Homebrew ca-certificates, system CA bundle files
 # and OS CA packages. For each tool found it runs two checks:
 #   1. Live probe   - the tool itself connects to hosts that chain to the
@@ -27,7 +27,7 @@
 # Exit status: 0 = nothing affected, 1 = at least one tool affected/likely
 # affected, 2 = usage error.
 
-VERSION_OF_SCRIPT=0.2.0
+VERSION_OF_SCRIPT=0.3.0
 
 BAD_URLS="https://dv-g3b-emudhra.we-have-a-problem.com/ https://dv-g3b-aaa-emudhra.we-have-a-problem.com/"
 CONTROL_URL="https://example.com/"
@@ -40,7 +40,7 @@ usage() {
   cat <<EOF
 Usage: ${0##*/} [--no-network] [--no-guidance] [--verbose] [-h|--help]
 
-Read-only audit of developer tools (curl, Go, Python, Java, Node.js, Deno, Bun,
+Read-only audit of developer tools (curl, git, Go, Python, Java, Node.js, Deno, Bun,
 rustup, uv, pixi, mise, Claude Code, Electron apps, Homebrew and OS CA bundles)
 against the eMudhra intermediate CA compromise. Prints remediation guidance for
 anything affected; it never changes the system.
@@ -86,6 +86,7 @@ NEED_SYS=0; NEED_PIPMAC=0  # shared guidance blocks to print (only if an affecte
 BREW_PREFIX=
 PYBIN=
 PROBE_RES=
+NODE_SYSCA_RES=
 
 # ---------------------------------------------------------------- helpers
 
@@ -95,6 +96,56 @@ log_cmd() { [ "$VERBOSE" -eq 1 ] && printf '%s  $ %s%s\n' "$C_DIM" "$*" "$C_OFF"
 show_err() {
   [ "$VERBOSE" -eq 1 ] && [ -s "$TMP/err" ] && sed 's/^/  /' "$TMP/err"
   : > "$TMP/err"
+  return 0
+}
+
+# run_to SECS CMD... : run a command, killing it after SECS seconds (no coreutils timeout needed).
+run_to() {
+  local secs=$1 pid wd rc
+  shift
+  "$@" &
+  pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid" 2>/dev/null
+  rc=$?
+  kill "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  return $rc
+}
+
+ENV_CA_VARS="SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE REQUESTS_CA_BUNDLE PIP_CERT GIT_SSL_CAINFO GIT_SSL_CAPATH NODE_EXTRA_CA_CERTS NODE_USE_SYSTEM_CA"
+
+# env_notes VAR... : "note:" lines for any of the named environment variables that are set.
+env_notes() {
+  local v val out=
+  for v in "$@"; do
+    val=${!v}
+    [ -n "$val" ] && out="${out:+$out
+}    note:    $v=$val"
+  done
+  printf '%s' "$out"
+}
+
+audit_env() {
+  section "CA-related environment"
+  local v val any=0
+  for v in $ENV_CA_VARS; do
+    val=${!v}
+    if [ -n "$val" ]; then printf '  %s=%s\n' "$v" "$val"; any=1; fi
+  done
+  for v in NODE_OPTIONS JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS; do
+    val=${!v}
+    case $val in
+      *system-ca*|*extra-ca*|*cert*|*tls*|*trustStore*|*truststore*) printf '  %s=%s\n' "$v" "$val"; any=1 ;;
+    esac
+  done
+  [ "$any" -eq 0 ] && echo "  no CA-related variables set"
+  [ -n "${GIT_SSL_NO_VERIFY:-}" ]          && printf '  %sWARNING%s GIT_SSL_NO_VERIFY is set: git skips certificate checks, so git will report AFFECTED.\n' "$C_RED" "$C_OFF"
+  [ "${NODE_TLS_REJECT_UNAUTHORIZED:-}" = 0 ] && printf '  %sWARNING%s NODE_TLS_REJECT_UNAUTHORIZED=0: Node skips certificate checks, so Node will report AFFECTED.\n' "$C_RED" "$C_OFF"
+  [ "${PYTHONHTTPSVERIFY:-}" = 0 ]         && printf '  %sWARNING%s PYTHONHTTPSVERIFY=0 is set (ignored by the isolated probes, but affects your own Python scripts).\n' "$C_RED" "$C_OFF"
+  echo "  The probes below inherit this environment, so each result is how the tool behaves in this shell."
+  echo
   return 0
 }
 
@@ -155,14 +206,21 @@ judge() {
   echo "inconclusive:test hosts unreachable or failed for a non-certificate reason"
 }
 
-# combine_probe P1 P2 : overall verdict from two probe verdicts (P2 may be empty)
+# combine_probe V... : overall verdict from several probe verdicts (empty ones ignored).
+# Any trusted wins; otherwise any rejected; otherwise the first non-skipped verdict.
 combine_probe() {
-  case "$1" in trusted*) echo trusted; return ;; esac
-  case "$2" in trusted*) echo trusted; return ;; esac
-  case "$1" in
-    rejected) case "$2" in ""|rejected|skipped*) echo rejected; return ;; esac ;;
-  esac
-  echo "$1"
+  local v first= rej=0
+  for v in "$@"; do
+    case $v in
+      "")       ;;
+      trusted*) echo trusted; return ;;
+      rejected) rej=1 ;;
+      skipped*) ;;
+      *)        [ -z "$first" ] && first=$v ;;
+    esac
+  done
+  if [ "$rej" -eq 1 ]; then echo rejected; return; fi
+  echo "${first:-$1}"
 }
 
 describe_probe() {
@@ -382,10 +440,7 @@ audit_curl() {
       out=$(curl_probe_all "$c")
       res=$(printf '%s\n' "$out" | judge)
     fi
-    env_note=
-    [ -n "${CURL_CA_BUNDLE:-}" ] && env_note="    note:    CURL_CA_BUNDLE=$CURL_CA_BUNDLE"
-    [ -n "${SSL_CERT_FILE:-}" ]  && env_note="${env_note:+$env_note
-}    note:    SSL_CERT_FILE=$SSL_CERT_FILE"
+    env_note=$(env_notes CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR)
     [ "${res%%:*}" = trusted ] && fix_curl "$c"
     report "curl" "$c" "${ver:-?} (TLS: ${tls:-?})" na "no fixed curl version; depends on the CA bundle/OS trust store in use" "$res" "$env_note"
   done
@@ -463,9 +518,34 @@ python_candidates() {
   done
 }
 
+# pip_probe_all PYTHON : pip's own TLS behaviour. Asks each host's /simple/ index for a package
+# that does not exist; any HTTP answer (even 404) means the TLS handshake was accepted.
+pip_probe_all() {
+  local u rc out
+  for u in $CONTROL_URL $BAD_URLS; do
+    rm -rf "$TMP/pipdl"
+    run_to 40 "$1" -I -m pip download --no-deps --no-input --disable-pip-version-check \
+      --retries 0 --timeout 10 -d "$TMP/pipdl" --index-url "${u}simple/" emudhra-probe-does-not-exist \
+      >"$TMP/pipout" 2>&1 </dev/null
+    rc=$?
+    if grep -qi -E 'CERTIFICATE_VERIFY_FAILED|certificate verify failed|SSLCertVerificationError|problem confirming the ssl certificate|SSLError' "$TMP/pipout"; then
+      out=certerr
+    elif [ "$rc" -ge 128 ] || grep -qi -E 'NewConnectionError|Name or service not known|nodename nor servname|Temporary failure|ConnectTimeout|ReadTimeout|ProxyError|Connection refused|timed out|No module named' "$TMP/pipout"; then
+      out=err
+    else
+      out=ok
+    fi
+    if [ "$out" != ok ]; then
+      { grep -i -m1 -E 'CERTIFICATE_VERIFY_FAILED|certificate verify failed|SSLError|ssl certificate|NewConnection|timed out|ProxyError|No module' "$TMP/pipout" || tail -1 "$TMP/pipout"; } |
+        cut -c1-220 | sed 's/^/    error: /' >> "$TMP/err"
+    fi
+    echo "$out $u"
+  done
+}
+
 audit_python() {
   section "Python"
-  local found=0 p key info pv cf pip cafile ossl res1 res2 res vc vn out extra
+  local found=0 p key info pv cf pip cafile ossl res1 res2 res3 res vc vn out extra envn
   local cands
   cands=$(python_candidates | awk '!s[$0]++')
   for p in $cands; do
@@ -503,7 +583,7 @@ audit_python() {
     fi
 
     if [ "$NO_NETWORK" -eq 1 ]; then
-      res="skipped:--no-network"; res1=$res; res2=
+      res="skipped:--no-network"; res1=$res; res2=; res3=
     else
       log_cmd "$p -I <tmp>/py_probe.py default <urls>"
       out=$("$p" -I "$TMP/py_probe.py" default $CONTROL_URL $BAD_URLS 2>"$TMP/err")
@@ -516,14 +596,27 @@ audit_python() {
         show_err
         res2=$(printf '%s\n' "$out" | judge)
       fi
-      res=$(combine_probe "$res1" "$res2")
+      if "$p" -I -m pip --version >/dev/null 2>&1 </dev/null; then
+        log_cmd "$p -I -m pip download --no-deps --index-url <host>/simple/ emudhra-probe-does-not-exist"
+        out=$(pip_probe_all "$p")
+        show_err
+        res3=$(printf '%s\n' "$out" | judge)
+      else
+        res3="skipped:pip is not installed for this interpreter"
+      fi
+      res=$(combine_probe "$res1" "$res2" "$res3")
     fi
     extra="    detail:  default trust store: $(describe_probe "$res1")"
     [ -n "$res2" ] && extra="$extra
              certifi bundle:      $(describe_probe "$res2")"
+    [ -n "$res3" ] && extra="$extra
+             pip download:        $(describe_probe "$res3")"
     extra="$extra
              OpenSSL cafile:      ${cafile:-none}  (${ossl:-?})"
-    fix_python "$p" "$cafile" "$res1" "$res2" "$vc"
+    envn=$(env_notes SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE PIP_CERT)
+    [ -n "$envn" ] && extra="$extra
+$envn"
+    fix_python "$p" "$cafile" "$res1" "$res2" "$vc" "$res3"
     report "Python" "$p" "$pv" "$vc" "$vn" "$res" "$extra"
   done
   [ "$found" -eq 0 ] && { echo "  not found"; echo; }
@@ -686,7 +779,7 @@ fix_go() {
 }
 
 fix_python() {
-  local p=$1 cafile=$2 r1=$3 r2=$4 vc=$5
+  local p=$1 cafile=$2 r1=$3 r2=$4 vc=$5 r3=$6
   if [ "${r1%%:*}" = trusted ]; then
     case $cafile in
       */etc/ca-certificates/*|*/etc/openssl*|*/Cellar/*)
@@ -701,18 +794,36 @@ fix_python() {
     fix "The certifi bundle trusts the compromised chain: python3 -m pip install --upgrade 'certifi>=2026.10.19'"
     fix "(use a virtualenv or pipx if the environment is externally managed)"
   fi
+  if [ "${r3%%:*}" = trusted ]; then
+    fix "pip itself accepts the compromised chain (it carries its own CA bundle): upgrade it to 26.2.2 or later."
+    fix "(PIP_CERT=/path/to/patched-bundle.pem is a stop-gap.)"
+  fi
   if [ "$vc" = behind ]; then
     fix "Upgrade pip and certifi: $p -m pip install --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'"
   fi
   if [ "$p" = /usr/bin/python3 ] && [ "$(uname)" = Darwin ]; then
-    if [ "${r1%%:*}" = trusted ] || [ "$vc" = behind ]; then
+    if [ "${r1%%:*}" = trusted ] || [ "${r3%%:*}" = trusted ] || [ "$vc" = behind ]; then
       fix "Apple's built-in pip: see Built-in pip (macOS) below."; FIXPIP=1
     fi
   fi
 }
 
+AWK_JAVA_ALIASES='/^Alias name:/{a=substr($0,13)} /^Owner:/ && /CN=(AAA Certificate Services|emSign ECC Root CA - G3)/{print a}'
+
+# java_cacerts JAVA_HOME : path of the JDK's default trust store, if present.
+java_cacerts() {
+  if [ -f "$1/lib/security/cacerts" ]; then echo "$1/lib/security/cacerts"
+  elif [ -f "$1/jre/lib/security/cacerts" ]; then echo "$1/jre/lib/security/cacerts"; fi
+}
+
+# java_affected_aliases KEYTOOL CACERTS : read-only; aliases whose subject is one of the two roots
+# the advisory says to distrust. Matching on subject (not alias) because aliases differ by vendor.
+java_affected_aliases() {
+  "$1" -J-Duser.language=en -list -v -keystore "$2" -storepass changeit 2>/dev/null </dev/null | awk "$AWK_JAVA_ALIASES"
+}
+
 fix_java() {
-  local h=$1 res=$2 how
+  local h=$1 res=$2 how cac kt n
   how=$(where_from "$h")
   case $how in
     sdkman) fix "sdk list java   # pick a build at or above $FIXV, then:"
@@ -727,6 +838,24 @@ fix_java() {
       esac ;;
   esac
   fix "Java uses its own cacerts/distrust list, so OS-level workarounds do not help; update the JDK."
+  cac=$(java_cacerts "$h")
+  kt=$h/bin/keytool
+  if [ -n "$cac" ] && [ -x "$kt" ]; then
+    n=$(java_affected_aliases "$kt" "$cac" | grep -c .)
+    if [ "$n" -gt 0 ]; then
+      fix "Stop-gap if no fixed build is available yet (this JDK's cacerts holds $n of the roots to distrust;"
+      fix "the script has not tested that removing them stops the probe connecting):"
+      fix "  R=\"$cac\"      # prefix commands with sudo if you cannot write to it"
+      fix "  cp -p \"\$R\" \"\$R.pre-emudhra\""
+      fix "  \"$kt\" -J-Duser.language=en -list -v -keystore \"\$R\" -storepass changeit | awk '$AWK_JAVA_ALIASES' |"
+      fix "    while IFS= read -r a; do \"$kt\" -delete -alias \"\$a\" -keystore \"\$R\" -storepass changeit; done"
+      fix "  Side effects: Java will reject sites chained to those roots (some Sectigo-issued certificates), and a"
+      fix "  JDK upgrade restores them. Undo with: cp -p \"\$R.pre-emudhra\" \"\$R\""
+    elif [ "${res%%:*}" = trusted ]; then
+      fix "The default cacerts has none of the roots to distrust (or its password is not 'changeit'); check for a"
+      fix "custom truststore: -Djavax.net.ssl.trustStore, JAVA_TOOL_OPTIONS or JDK_JAVA_OPTIONS."
+    fi
+  fi
 }
 
 # --------------------------------------------------------------- more probes
@@ -848,13 +977,25 @@ fix_node() {
     brew)  fix "brew update && brew upgrade node" ;;
     *)     fix "Install Node.js $FIXV or later (https://nodejs.org/en/download or your package manager)." ;;
   esac
-  fix "Node.js ships its own CA list, so OS-level workarounds do not apply; upgrade the runtime."
+  fix "Node.js uses its own bundled CA list by default, so editing OS bundles does not normally change it"
+  fix "(unless NODE_EXTRA_CA_CERTS or --use-system-ca is in play): upgrade the runtime."
+  case ${NODE_SYSCA_RES%%:*} in
+    rejected)
+      fix "Stop-gap: run with --use-system-ca (or NODE_USE_SYSTEM_CA=1) so Node uses the OS trust store."
+      fix "Tested here: with that flag Node rejects the chain, because this OS store already blocks it. That only"
+      fix "holds while the OS store stays patched, so still upgrade the runtime." ;;
+    trusted)
+      fix "Tested here: --use-system-ca does not help; Node still accepts the chain with it (it may not apply the"
+      fix "OS revocation block). Upgrading the runtime is the fix." ;;
+    skipped)
+      fix "This Node has no --use-system-ca, so upgrading is the only fix." ;;
+  esac
   fix "(Fixed releases: 22.23.4, 24.22.1, 26.12.1.)"
 }
 
 audit_node() {
   section "Node.js"
-  local found=0 n key v
+  local found=0 n key v nres extra
   while IFS= read -r n; do
     [ -n "$n" ] && [ -x "$n" ] || continue
     key="node:$(resolve "$n")"
@@ -863,8 +1004,21 @@ audit_node() {
     v=$("$n" --version 2>/dev/null </dev/null)
     check_node_version "$v"
     runtime_probe "$n" "$TMP/node_probe.js"
-    if [ "${PROBE_RES%%:*}" = trusted ] || [ "$VC" = behind ] || [ "$VC" = nofix ]; then fix_node "$n"; fi
-    report "Node.js" "$n" "${v:-?}" "$VC" "$VN" "$PROBE_RES"
+    nres=$PROBE_RES
+    NODE_SYSCA_RES=
+    if [ "${nres%%:*}" = trusted ]; then
+      if "$n" --use-system-ca -e 0 >/dev/null 2>&1 </dev/null; then
+        runtime_probe "$n" --use-system-ca "$TMP/node_probe.js"
+        NODE_SYSCA_RES=$PROBE_RES
+      else
+        NODE_SYSCA_RES="skipped:no --use-system-ca"
+      fi
+    fi
+    extra=$(env_notes NODE_EXTRA_CA_CERTS NODE_USE_SYSTEM_CA)
+    [ -n "$NODE_SYSCA_RES" ] && extra="${extra:+$extra
+}    detail:  with --use-system-ca: $(describe_probe "$NODE_SYSCA_RES")"
+    if [ "${nres%%:*}" = trusted ] || [ "$VC" = behind ] || [ "$VC" = nofix ]; then fix_node "$n"; fi
+    report "Node.js" "$n" "${v:-?}" "$VC" "$VN" "$nres" "$extra"
   done <<EOF
 $(node_candidates | awk '!s[$0]++')
 EOF
@@ -1087,6 +1241,79 @@ audit_electron() {
   return 0
 }
 
+# ------------------------------------------------------------------- git
+
+# git_probe_all GIT : prints "<result> <url>" for the control and test hosts. git ls-remote
+# against a non-repository: a TLS failure mentions the certificate; any HTTP-level answer
+# ("not found", auth needed) means the handshake was accepted.
+git_probe_all() {
+  local u rc out
+  export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true
+  cd "$TMP" || return
+  for u in $CONTROL_URL $BAD_URLS; do
+    run_to 25 "$1" -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 ls-remote "$u" \
+      >/dev/null 2>"$TMP/gitout" </dev/null
+    rc=$?
+    if grep -qi 'certificate' "$TMP/gitout"; then out=certerr
+    elif [ "$rc" -eq 0 ]; then out=ok
+    elif grep -qi -E 'returned error|not found|not valid|is this a git repository|not a git repository|does not appear to be a git|authentication failed|could not read (username|password)' "$TMP/gitout"; then out=ok
+    else out=err
+    fi
+    [ "$out" != ok ] && sed 's/^/    error: /' "$TMP/gitout" | head -3 >> "$TMP/err"
+    echo "$out $u"
+  done
+}
+
+fix_git() {
+  [ "${2%%:*}" = trusted ] || return 0
+  case $(where_from "$1") in
+    brew) fix "brew update && brew upgrade git ca-certificates" ;;
+    *)
+      if [ "$1" = /usr/bin/git ] && [ "$(uname)" = Darwin ]; then
+        fix "Apple's git reads /etc/ssl/cert.pem and does not check revocation: see System trust store below,"
+        fix "or use Homebrew's git: brew install git && brew upgrade ca-certificates"
+      else
+        fix "git uses the OS/curl CA bundle (http.sslCAInfo or GIT_SSL_CAINFO if set): update ca-certificates,"
+        fix "or see System trust store below."
+      fi
+      FIXSYS=1 ;;
+  esac
+}
+
+audit_git() {
+  section "git"
+  local found=0 g v res out cfg extra
+  while IFS= read -r g; do
+    [ -n "$g" ] && [ -x "$g" ] || continue
+    # macOS /usr/bin/git is a stub that prompts to install the Command Line Tools.
+    if [ "$g" = /usr/bin/git ] && [ "$(uname)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; then continue; fi
+    first_time "git:$(resolve "$g")" || continue
+    found=1
+    v=$("$g" --version 2>/dev/null </dev/null | awk '{print $3}')
+    if [ "$NO_NETWORK" -eq 1 ]; then
+      res="skipped:--no-network"
+    else
+      log_cmd "$g ls-remote <url>   (control + test hosts)"
+      out=$(git_probe_all "$g")
+      show_err
+      res=$(printf '%s\n' "$out" | judge)
+    fi
+    extra=$(env_notes GIT_SSL_CAINFO GIT_SSL_CAPATH SSL_CERT_FILE)
+    cfg=$(cd "$TMP" && "$g" config --get http.sslCAInfo 2>/dev/null </dev/null)
+    [ -n "$cfg" ] && extra="${extra:+$extra
+}    note:    http.sslCAInfo=$cfg"
+    cfg=$(cd "$TMP" && "$g" config --get http.sslVerify 2>/dev/null </dev/null)
+    [ "$cfg" = false ] && extra="${extra:+$extra
+}    note:    http.sslVerify=false - git skips certificate checks"
+    fix_git "$g" "$res"
+    report "git" "$g" "${v:-?}" na "no fixed git version; depends on the CA bundle in use" "$res" "$extra"
+  done <<EOF
+$({ command -v git 2>/dev/null; ls /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git 2>/dev/null; } | awk '!s[$0]++')
+EOF
+  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  return 0
+}
+
 # --------------------------------------------------------- guidance (printing)
 
 print_sys_guidance() {
@@ -1109,7 +1336,8 @@ print_sys_guidance() {
       sudo awk '/^(###|===) /{skip=0}
         /^=== .*\/CN=(AAA Certificate Services|emSign ECC Root CA - G3)$/{skip=1}
         !skip' /etc/ssl/cert.pem.bak | sudo tee /etc/ssl/cert.pem > /dev/null
-      (An OS update may replace this file; re-run the audit afterwards to confirm.)
+      (An OS update may replace this file. Others report that macOS updates do not refresh it, so re-run
+       the audit after updating rather than assuming either way.)
 EOF
       ;;
     *alpine*)
@@ -1242,7 +1470,9 @@ else
 fi
 echo
 
+audit_env
 audit_curl
+audit_git
 audit_go
 audit_python
 audit_java

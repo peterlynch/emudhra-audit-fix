@@ -81,10 +81,11 @@ protected, and lists the old version under "upgrade when convenient".
 | Tool | Live probe | Version check | Notes |
 |---|---|---|---|
 | curl | yes | no | The page lists no fixed curl version; it depends on the CA bundle in use. |
+| git | yes (`git ls-remote`) | no | Uses the OS/curl bundle, so it can differ from other tools. Also reports `http.sslCAInfo` and `http.sslVerify=false`. |
 | Go | yes | yes | Fixed in 1.26.10 and 1.27.3. |
-| Python | yes (default store, and `certifi` if installed) | yes | Checks `certifi` >= 2026.10.19 and `pip` >= 26.2.2. Every interpreter found is checked. |
+| Python | yes (default store, `certifi` if installed, and `pip download`) | yes | Checks `certifi` >= 2026.10.19 and `pip` >= 26.2.2. Every interpreter found is checked. |
 | Java (JDK/JRE) | yes, needs a `javac` somewhere on the machine | yes | Every install found is checked. Fixed in 8u511, 11.0.33, 17.0.21, 21.0.13, 25.0.5, 27.0.1. |
-| Node.js | yes | yes | Fixed in 22.23.4, 24.22.1, 26.12.1. |
+| Node.js | yes (and again with `--use-system-ca` when affected) | yes | Fixed in 22.23.4, 24.22.1, 26.12.1. |
 | Deno | yes | yes | Fixed in 2.9.8. |
 | Bun | yes | no | The page lists the fix as pending. |
 | rustup | no | yes | Fixed in 1.29.2. |
@@ -107,6 +108,14 @@ pyenv, SDKMAN, Homebrew, `/usr/lib/jvm`, `/Library/Java/JavaVirtualMachines` and
 - Containers, per-project virtualenvs and `node_modules`.
 - Electron apps on Windows and Linux.
 - Windows hosts (the script is a Bash script for Unix-like systems).
+
+### Environment overrides
+
+The script starts with a "CA-related environment" section listing variables that change which trust store a tool uses
+(`SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `GIT_SSL_CAINFO`,
+`NODE_EXTRA_CA_CERTS`, `NODE_USE_SYSTEM_CA`). It warns about settings that disable verification
+(`GIT_SSL_NO_VERIFY`, `NODE_TLS_REJECT_UNAUTHORIZED=0`). The probes inherit your environment, so results describe how
+each tool behaves in your shell, which may differ from a clean login or from CI.
 
 ## Reading the output
 
@@ -153,8 +162,12 @@ current platform is printed, and only if an affected item needs it.
 
 Prefer upgrading over the workaround. The workaround removes two widely used roots (`AAA Certificate Services` and
 `emSign ECC Root CA - G3`) from the trust store, which can break legitimate sites that chain to them, and an OS update may
-replace the edited file. Java, Node.js and Electron apps use their own trust lists, so OS-level workarounds do not help
-them; they need an upgrade.
+replace the edited file. Java and Electron apps use their own trust lists, so OS-level workarounds do not help them; they need an upgrade. Node.js
+uses its own bundled list by default; the script tests `--use-system-ca` and says whether it helps on your machine.
+
+If no fixed JDK build is available yet, the guidance for a Java install also prints a stop-gap: back up that JDK's
+`cacerts` and delete the entries for the two roots. It is untested as a fix, makes Java reject sites chained to those
+roots, and is undone by a JDK upgrade or by restoring the backup.
 
 **The script never runs any of this guidance.** It only prints it. Read each command before running it; the trust-store
 commands need `sudo`.
@@ -173,7 +186,8 @@ After changing anything, run the script again to confirm.
   - Testing CA bundle files and Homebrew's bundle uses a Python 3.8 or later interpreter found by the audit.
 
 Tested on macOS (Apple silicon) with Bash 3.2. The Linux and BSD code paths (package checks and per-distribution guidance)
-have **not** been exercised yet.
+have **not** been exercised yet. The macOS workaround edits `/etc/ssl/cert.pem`; reports differ on whether macOS updates
+refresh that file, so re-run the audit after updating rather than assuming.
 
 ## Safety
 
