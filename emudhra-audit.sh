@@ -1693,16 +1693,17 @@ fx_ok()   { printf '  %s✓ %s%s\n' "$C_GRN" "$*" "$C_OFF"; }
 fx_bad()  { printf '  %s✗ %s%s\n' "$C_RED" "$*" "$C_OFF"; }
 fx_cmd()  { printf '  %s  $ %s%s\n' "$C_DIM" "$*" "$C_OFF"; }
 
-# confirm PROMPT : y/N. --yes answers yes; no terminal means no.
+# confirm PROMPT : y/N. --yes answers yes. Otherwise it asks on the controlling terminal (/dev/tty), not stdin,
+# because the fix loops read their plan from a here-document, which replaces stdin. No terminal means no.
 confirm() {
   [ "$YES" -eq 1 ] && return 0
-  if [ ! -t 0 ]; then
+  local a=
+  if ! { : </dev/tty; } 2>/dev/null; then
     fx_warn "no terminal to ask on - skipping (use --yes to run unattended)"
     return 1
   fi
-  local a
-  printf '  %s [y/N] ' "$1"
-  read -r a
+  printf '  %s [y/N] ' "$1" >/dev/tty
+  read -r a </dev/tty
   case $a in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
@@ -2096,12 +2097,16 @@ run_fixes() {
     fx_warn "this Mac appears to be enrolled in MDM ($(profiles status -type enrollment 2>/dev/null </dev/null | tr '\n' ' ' | cut -c1-110)): IT may overwrite these changes, or want to make them centrally"
   fi
   # order: package/upgrade fixes first, then the system store, then the stop-gaps that depend on it
+  # Iterate with `for` over newline-split lines, NOT `while read <<EOF`: a here-document would replace stdin
+  # for everything run inside the loop (brew, keytool, prompts), which is how confirm() once lost its terminal.
+  local oldifs=$IFS
+  IFS=$'\n'
   for kind in brew sys java macpip; do
-    while IFS= read -r line; do
-      [ -z "$line" ] && continue
-      case $line in "$kind|"*) ;; *) continue ;; esac
+    for line in $PLAN; do
+      IFS=$oldifs
+      case $line in "$kind|"*) ;; *) IFS=$'\n'; continue ;; esac
       target=${line#*|}
-      [ -n "$ONLY" ] && [ "$ONLY" != "$kind" ] && continue
+      if [ -n "$ONLY" ] && [ "$ONLY" != "$kind" ]; then IFS=$'\n'; continue; fi
       ran=1
       case $kind in
         brew)   fix_brew_store "$target" ;;
@@ -2109,10 +2114,10 @@ run_fixes() {
         java)   fix_java_store "$target" ;;
         macpip) fix_macos_pip ;;
       esac
-    done <<EOF
-$PLAN
-EOF
+      IFS=$'\n'
+    done
   done
+  IFS=$oldifs
   echo
   [ "$ran" -eq 0 ] && echo "  Nothing matched${ONLY:+ --only $ONLY}."
   printf '  %sChanged: %s   Failed or refused: %s   Skipped: %s%s\n' "$C_BLD" "$FIXED_N" "$FAILED_N" "$SKIPPED_N" "$C_OFF"

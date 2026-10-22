@@ -249,8 +249,10 @@ finds. `--undo` also removes the p11-kit blocklist files that `--fix` created. H
 | Fedora 41 (p11-kit blocklist) | Tested in a container, same cycle. `--undo` removes only the files the script created. |
 | OS package version checks (dpkg, apk, rpm) | Tested on Ubuntu, Debian, Alpine 3.18 and 3.20, and Fedora 41. |
 | `--dry-run` on macOS for `sys`, `java`, `brew` and `macpip` | Tested. |
-| `--yes` validation, no-terminal behaviour, bad flags | Tested. |
-| The macOS system-bundle edit itself (needs sudo), `brew` upgrade, `macpip` | **Not applied for real.** Dry run only. |
+| The confirmation prompt under a real pseudo-terminal, and refusal with no terminal (`tests/test_confirm_prompt.sh`) | Tested. The test fails on the earlier code that lost the terminal. |
+| `--yes` validation, bad flags | Tested. |
+| The macOS system-bundle edit, `brew` upgrade and Java `cacerts` fix on a real machine | Applied for real by the maintainer's own `--fix` run on macOS; the audit afterwards reports the items as protected. Not independently observed by the test suite. |
+| The macOS `macpip` fix | **Not applied for real.** Dry run only. |
 | openSUSE/SLES, Arch, NixOS, RHEL/CentOS/Rocky/Alma, Amazon Linux, FreeBSD, NetBSD | **Not tested.** The SUSE and Arch paths reuse the Fedora blocklist code with different directories. |
 | Linux on x86-64 | Tested on arm64 containers only. |
 
