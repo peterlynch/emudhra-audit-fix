@@ -28,20 +28,29 @@ scenario() {
 S=/src/emudhra-audit.sh
 step() { printf '\n##### %s\n' "$*"; }
 step "1. audit before"
-bash $S --no-guidance 2>&1 | sed -n '/^== CA bundle\|^== System CA/,/^== OS CA/p' | grep -E '^\[|probe:|path:' | head -8
+bash $S -v --no-guidance 2>&1 | sed -n '/^== CA bundle\|^== System CA/,/^== OS CA/p' | grep -E '^\[|probe:|path:' | head -8
 step "2. dry-run"
 bash $S --fix --dry-run --only=sys --no-guidance 2>&1 </dev/null | sed -n '/^== Fix/,$p' | grep -v '^$'
 step "3. real fix"
 bash $S --fix --yes --only=sys --no-guidance 2>&1 </dev/null | sed -n '/^== Fix/,$p' | grep -v '^$'
 step "4. audit after"
-bash $S --no-guidance 2>&1 | sed -n '/^== System CA/,/^== OS CA/p' | grep -E '^\[|probe:|path:' | head -8
+bash $S -v --no-guidance 2>&1 | sed -n '/^== System CA/,/^== OS CA/p' | grep -E '^\[|probe:|path:' | head -8
 step "5. fix again (should be a no-op)"
 bash $S --fix --yes --only=sys --no-guidance 2>&1 </dev/null | sed -n '/^== Fix/,$p' | grep -v '^$' | head -8
 step "6. undo"
 bash $S --undo --yes 2>&1 </dev/null | sed -n '/^== Undo/,$p' | grep -v '^$'
 step "7. audit after undo"
-bash $S --no-guidance 2>&1 | sed -n '/^== System CA/,/^== OS CA/p' | grep -E '^\[|probe:|path:' | head -8
+bash $S -v --no-guidance 2>&1 | sed -n '/^== System CA/,/^== OS CA/p' | grep -E '^\[|probe:|path:' | head -8
 EOS
+}
+
+# grade_run : read a finished run on stdin; exit 1 if any audit step printed no [OK]/[AFFECTED] verdict.
+grade_run() {
+  awk '/^##### [147]\./{ if (step != "" && !seen) { printf "  FAIL: step %s printed no verdict\n", step; bad=1 } step=$2; seen=0; next }
+       /^##### /{ if (step != "" && !seen) { printf "  FAIL: step %s printed no verdict\n", step; bad=1 } step=""; next }
+       /^\[(OK|AFFECTED|LIKELY-OK|LIKELY-AFFECTED|UNKNOWN)\]/{ seen=1 }
+       { print }
+       END { if (step != "" && !seen) { printf "  FAIL: step %s printed no verdict\n", step; bad=1 } exit bad }'
 }
 
 for img in $IMAGES; do
@@ -53,8 +62,8 @@ for img in $IMAGES; do
   scen=$(mktemp "${TMPDIR:-/tmp}/emudhra-scenario.XXXXXX")
   scenario > "$scen"
   docker run --rm -v "$HERE":/src:ro -v "$scen":/scenario.sh:ro -e TERM=dumb "$img" \
-    sh -c "$setup; command -v bash >/dev/null || { echo 'bash is missing'; exit 3; }; bash /scenario.sh" 2>&1
-  rc=$?
+    sh -c "$setup; command -v bash >/dev/null || { echo 'bash is missing'; exit 3; }; bash /scenario.sh" 2>&1 | grade_run
+  rc=${PIPESTATUS[0]}; [ "${PIPESTATUS[1]}" -ne 0 ] && rc=1
   rm -f "$scen"
   echo "(container exit: $rc)"
 done

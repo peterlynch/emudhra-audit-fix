@@ -33,7 +33,7 @@
 # Exit status: 0 = nothing affected, 1 = at least one tool affected/likely
 # affected, 2 = usage error.
 
-VERSION_OF_SCRIPT=0.4.0
+VERSION_OF_SCRIPT=0.5.0
 
 BAD_URLS="https://dv-g3b-emudhra.we-have-a-problem.com/ https://dv-g3b-aaa-emudhra.we-have-a-problem.com/"
 # The control host must NOT chain to either root the advisory says to distrust, or a correctly
@@ -41,7 +41,7 @@ BAD_URLS="https://dv-g3b-emudhra.we-have-a-problem.com/ https://dv-g3b-aaa-emudh
 CONTROL_URL="https://github.com/"
 
 NO_NETWORK=0
-VERBOSE=0
+VERBOSE=0   # 0 compact (default), 1 full detail (-v), 2 plus probe commands and raw TLS errors (-vv)
 NO_GUIDE=0
 FIXMODE=0
 DRY=0
@@ -59,10 +59,11 @@ pixi, mise, Claude Code, Electron apps, Homebrew and OS CA bundles) against the 
 intermediate CA compromise. By default it is read-only: it prints remediation guidance
 for anything affected and changes nothing.
 
-Audit options:
+Audit options (the default output is a compact summary; use -v for the full report):
   --no-network      skip live TLS probes; version checks only
   --no-guidance     do not print remediation guidance
-  --verbose         print the probe commands that are run, and raw TLS errors
+  -v, --verbose     full detail: path, version and probe result for every item, full guidance
+  -vv               also print the probe commands that are run, and raw TLS errors
 
 Fix options (these can modify the system; sudo is used where needed):
   --fix             after the audit, offer to apply fixes, asking before each change
@@ -81,7 +82,8 @@ for arg in "$@"; do
   case $arg in
     --no-network)  NO_NETWORK=1 ;;
     --no-guidance) NO_GUIDE=1 ;;
-    --verbose)     VERBOSE=1 ;;
+    -v|--verbose)  [ "$VERBOSE" -lt 1 ] && VERBOSE=1 ;;
+    -vv)           VERBOSE=2 ;;
     --fix)         FIXMODE=1 ;;
     --dry-run)     DRY=1; FIXMODE=1 ;;
     --yes)         YES=1 ;;
@@ -123,6 +125,8 @@ FIXV=            # fixed version(s) for the tool being checked (set by check_*_v
 FIX=             # guidance lines for the item about to be reported (see fix())
 GUIDE=           # accumulated guidance for affected items
 ADVISE=          # accumulated guidance for items that are protected but behind
+CGUIDE=          # compact (one line per item) versions of GUIDE and ADVISE
+CADVISE=
 FIXSYS=0; FIXPIP=0       # set by fix_* when an item's guidance points at a shared block
 NEED_SYS=0; NEED_PIPMAC=0  # shared guidance blocks to print (only if an affected item needs them)
 BREW_PREFIX=
@@ -134,11 +138,11 @@ PLAN=$'\n'              # fixes this script can apply: kind|target lines (see pl
 
 # ---------------------------------------------------------------- helpers
 
-log_cmd() { [ "$VERBOSE" -eq 1 ] && printf '%s  $ %s%s\n' "$C_DIM" "$*" "$C_OFF"; return 0; }
+log_cmd() { [ "$VERBOSE" -ge 2 ] && printf '%s  $ %s%s\n' "$C_DIM" "$*" "$C_OFF"; return 0; }
 
 # Under --verbose, show (then clear) any raw errors a probe wrote to $TMP/err.
 show_err() {
-  [ "$VERBOSE" -eq 1 ] && [ -s "$TMP/err" ] && sed 's/^/  /' "$TMP/err"
+  [ "$VERBOSE" -ge 2 ] && [ -s "$TMP/err" ] && sed 's/^/  /' "$TMP/err"
   : > "$TMP/err"
   return 0
 }
@@ -172,24 +176,29 @@ env_notes() {
 }
 
 audit_env() {
-  section "CA-related environment"
-  local v val any=0
+  local v val any=0 warn=0 out=
   for v in $ENV_CA_VARS; do
     val=${!v}
-    if [ -n "$val" ]; then printf '  %s=%s\n' "$v" "$val"; any=1; fi
+    if [ -n "$val" ]; then out="${out}  $v=$val"$'\n'; any=1; fi
   done
   for v in NODE_OPTIONS JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS; do
     val=${!v}
     case $val in
-      *system-ca*|*extra-ca*|*cert*|*tls*|*trustStore*|*truststore*) printf '  %s=%s\n' "$v" "$val"; any=1 ;;
+      *system-ca*|*extra-ca*|*cert*|*tls*|*trustStore*|*truststore*) out="${out}  $v=$val"$'\n'; any=1 ;;
     esac
   done
-  [ "$any" -eq 0 ] && echo "  no CA-related variables set"
-  [ -n "${GIT_SSL_NO_VERIFY:-}" ]          && printf '  %sWARNING%s GIT_SSL_NO_VERIFY is set: git skips certificate checks, so git will report AFFECTED.\n' "$C_RED" "$C_OFF"
-  [ "${NODE_TLS_REJECT_UNAUTHORIZED:-}" = 0 ] && printf '  %sWARNING%s NODE_TLS_REJECT_UNAUTHORIZED=0: Node skips certificate checks, so Node will report AFFECTED.\n' "$C_RED" "$C_OFF"
-  [ "${PYTHONHTTPSVERIFY:-}" = 0 ]         && printf '  %sWARNING%s PYTHONHTTPSVERIFY=0 is set (ignored by the isolated probes, but affects your own Python scripts).\n' "$C_RED" "$C_OFF"
-  echo "  The probes below inherit this environment, so each result is how the tool behaves in this shell."
-  echo
+  [ -n "${GIT_SSL_NO_VERIFY:-}" ]          && { out="${out}  ${C_RED}WARNING${C_OFF} GIT_SSL_NO_VERIFY is set: git skips certificate checks, so git will report AFFECTED."$'\n'; warn=1; }
+  [ "${NODE_TLS_REJECT_UNAUTHORIZED:-}" = 0 ] && { out="${out}  ${C_RED}WARNING${C_OFF} NODE_TLS_REJECT_UNAUTHORIZED=0: Node skips certificate checks, so Node will report AFFECTED."$'\n'; warn=1; }
+  [ "${PYTHONHTTPSVERIFY:-}" = 0 ]         && { out="${out}  ${C_RED}WARNING${C_OFF} PYTHONHTTPSVERIFY=0 is set (ignored by the isolated probes, but affects your own Python scripts)."$'\n'; warn=1; }
+  if [ "$VERBOSE" -ge 1 ]; then
+    section "CA-related environment"
+    if [ "$any" -eq 0 ]; then echo "  no CA-related variables set"; else printf '%s' "$out"; fi
+    echo "  The probes below inherit this environment, so each result is how the tool behaves in this shell."
+    echo
+  elif [ "$any" -eq 1 ] || [ "$warn" -eq 1 ]; then
+    # compact: only say something if the environment could change the results
+    printf '%sCA-related environment (affects the results below):%s\n%s\n' "$C_BLD" "$C_OFF" "$out"
+  fi
   return 0
 }
 
@@ -307,32 +316,92 @@ report() {
   esac
   fx=$FIX
   [ -z "$fx" ] && fx="      (no specific guidance - see https://emudhra.we-have-a-problem.com/)"$'\n'
+  local first_fix
+  if [ -n "$FIXC" ]; then
+    first_fix=$FIXC
+  else
+    first_fix=$(printf '%s' "$fx" | sed -n '1s/^ *//p')
+    if [ "$(printf '%s' "$fx" | grep -c .)" -gt 1 ]; then first_fix="$first_fix ... (-v for the rest)"; fi
+  fi
   case $status in
     AFFECTED|LIKELY-AFFECTED)
       N_BAD=$((N_BAD + 1)); col=$C_RED
       [ "$FIXSYS" = 1 ] && { NEED_SYS=1; plan_add sys system; }
       [ "$FIXPIP" = 1 ] && { NEED_PIPMAC=1; plan_add macpip /usr/bin/python3; }
-      GUIDE="${GUIDE}  - ${tool} ${ver}"$'\n'"    ${path}"$'\n'"${fx}"$'\n' ;;
+      GUIDE="${GUIDE}  - ${tool} ${ver}"$'\n'"    ${path}"$'\n'"${fx}"$'\n'
+      CGUIDE="${CGUIDE}  - ${tool} ${ver}: ${first_fix}"$'\n' ;;
     OK|LIKELY-OK)
       N_OK=$((N_OK + 1)); col=$C_GRN
       if [ "$status" = OK ] && { [ "$vc" = behind ] || [ "$vc" = nofix ]; }; then
         ADVISE="${ADVISE}  - ${tool} ${ver}"$'\n'"    ${path}"$'\n'"${fx}"$'\n'
+        CADVISE="${CADVISE}  - ${tool} ${ver}: ${first_fix}"$'\n'
       fi ;;
     *)
       N_UNK=$((N_UNK + 1)); col=$C_YEL ;;
   esac
-  FIX=; FIXSYS=0; FIXPIP=0
+  FIX=; FIXC=; FIXSYS=0; FIXPIP=0
   vtxt=$(describe_version "$vc")
   [ -n "$vn" ] && vtxt="$vtxt - $vn"
-  printf '%s%s[%s]%s %s %s\n' "$C_BLD" "$col" "$status" "$C_OFF" "$tool" "$ver"
-  printf '    path:    %s\n' "$path"
-  printf '    version: %s\n' "$vtxt"
-  printf '    probe:   %s\n' "$(describe_probe "$pr")"
-  [ -n "$extra" ] && printf '%s\n' "$extra"
-  echo
+  if [ "$VERBOSE" -ge 1 ]; then
+    printf '%s%s[%s]%s %s %s\n' "$C_BLD" "$col" "$status" "$C_OFF" "$tool" "$ver"
+    printf '    path:    %s\n' "$path"
+    printf '    version: %s\n' "$vtxt"
+    printf '    probe:   %s\n' "$(describe_probe "$pr")"
+    [ -n "$extra" ] && printf '%s\n' "$extra"
+    echo
+  else
+    printf '%s%s[%s]%s %s %s' "$C_BLD" "$col" "$status" "$C_OFF" "$tool" "$ver"
+    printf '  %s%s%s' "$C_DIM" "$(compact_path "$path")" "$C_OFF"
+    local why
+    why=$(compact_why "$status" "$pr" "$vc" "$vn")
+    [ -n "$why" ] && printf '  - %s' "$why"
+    echo
+  fi
+}
+
+# compact_path PATH : shorten $HOME to ~ and trim very long paths.
+compact_path() {
+  local p=$1
+  case $p in "$HOME"/*) p="~/${p#"$HOME"/}" ;; esac
+  printf '%s' "$p"
+}
+
+# compact_why STATUS PROBE VC VN : the one reason worth showing next to a status.
+compact_why() {
+  local status=$1 pr=$2 vc=$3 vn=$4
+  vn=${vn%% (page lists*}
+  case $status in
+    AFFECTED)
+      case $vc in behind|nofix) echo "trusts the compromised chain; also behind ($vn)" ;; *) echo "trusts the compromised chain" ;; esac ;;
+    OK)
+      case $vc in behind|nofix) echo "rejects the chain, but older than the fixed release ($vn)" ;; *) echo "rejects the chain" ;; esac ;;
+    LIKELY-AFFECTED) echo "version-only: $vn" ;;
+    LIKELY-OK)       echo "version-only: $vn" ;;
+    *)               case $pr in inconclusive*) echo "${pr#inconclusive:}" | cut -c1-90 ;; skipped*) echo "${pr#skipped:}" ;; esac ;;
+  esac
 }
 
 section() { printf '%s== %s ==%s\n' "$C_BLD" "$1" "$C_OFF"; }
+
+# Compact mode helpers. In the default (compact) output, tools that are not installed are
+# collected into one line, and each section header is only printed if the tool was found.
+MISSING=
+CUR_SECTION=
+# audit_start NAME : begin a tool's audit. Verbose mode prints the header immediately; compact mode defers it.
+audit_start() {
+  CUR_SECTION=$1
+  [ "$VERBOSE" -ge 1 ] && section "$1"
+  return 0
+}
+# audit_none [TEXT] : the tool was not found. Verbose keeps the old per-section message; compact records it.
+audit_none() {
+  if [ "$VERBOSE" -ge 1 ]; then
+    echo "  ${1:-not found}"; echo
+  else
+    MISSING="${MISSING:+$MISSING, }$CUR_SECTION"
+  fi
+  return 0
+}
 
 # ----------------------------------------------------------- probe programs
 
@@ -463,7 +532,7 @@ curl_probe_all() {
 }
 
 audit_curl() {
-  section "curl"
+  audit_start "curl"
   local found=0 c key vline ver tls out res env_note
   local cands
   cands=$(
@@ -494,7 +563,7 @@ audit_curl() {
     [ "${res%%:*}" = trusted ] && fix_curl "$c"
     report "curl" "$c" "${ver:-?} (TLS: ${tls:-?})" na "no fixed curl version; depends on the CA bundle/OS trust store in use" "$res" "$env_note"
   done
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
 }
 
 # --------------------------------------------------------------------- Go
@@ -518,7 +587,7 @@ check_go_version() {
 }
 
 audit_go() {
-  section "Go"
+  audit_start "Go"
   local found=0 g key gv v res out d
   local cands
   cands=$(
@@ -548,7 +617,7 @@ audit_go() {
     fix_go "$g" "$res"
     report "Go" "$g" "${gv:-?}" "$VC" "$VN" "$res"
   done
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
 }
 
 # ----------------------------------------------------------------- Python
@@ -594,7 +663,7 @@ pip_probe_all() {
 }
 
 audit_python() {
-  section "Python"
+  audit_start "Python"
   local found=0 p key info pv cf pip cafile ossl res1 res2 res3 res vc vn out extra envn
   local cands
   cands=$(python_candidates | awk '!s[$0]++')
@@ -669,7 +738,7 @@ $envn"
     fix_python "$p" "$cafile" "$res1" "$res2" "$vc" "$res3"
     report "Python" "$p" "$pv" "$vc" "$vn" "$res" "$extra"
   done
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
 }
 
 # ------------------------------------------------------------------- Java
@@ -730,7 +799,7 @@ java_candidates() {
 }
 
 audit_java() {
-  section "Java (JRE/JDK)"
+  audit_start "Java (JRE/JDK)"
   local homes="" h hp key found=0 jv vendor res out j
   for h in $(java_candidates | awk '!s[$0]++'); do
     [ -x "$h/bin/java" ] || continue
@@ -772,13 +841,18 @@ audit_java() {
     fix_java "$h" "$res"
     report "Java" "$h" "$jv${vendor:+ ($vendor)}" "$VC" "$VN" "$res"
   done
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
 }
 
 # ------------------------------------------------- guidance helpers (print only)
 
 # fix LINE : add a guidance line for the item about to be reported.
 fix() { FIX="${FIX}      $1"$'\n'; }
+
+# fixc TEXT : the single line shown for this item in the compact (default) output.
+# Falls back to the first fix() line if a fix_* function does not set one.
+FIXC=
+fixc() { [ -z "$FIXC" ] && FIXC=$1; return 0; }
 
 # where_from PATH : how a tool was probably installed, to tailor upgrade advice.
 where_from() {
@@ -808,8 +882,9 @@ vcmp() {
 
 fix_curl() {
   case $(where_from "$1") in
-    brew) fix "brew update && brew upgrade curl ca-certificates" ;;
+    brew) fixc "brew upgrade curl ca-certificates"; fix "brew update && brew upgrade curl ca-certificates" ;;
     *)
+      fixc "patch the system CA bundle (or use Homebrew's curl)"
       if [ "$1" = /usr/bin/curl ] && [ "$(uname)" = Darwin ]; then
         fix "Apple's curl reads /etc/ssl/cert.pem and does not check revocation."
         fix "Apply the macOS bundle workaround (System trust store, below), or install Homebrew's curl"
@@ -824,6 +899,7 @@ fix_curl() {
 fix_go() {
   [ "${2%%:*}" = trusted ] && { fix "This Go build trusts the compromised chain via the OS trust store: see System trust store below."; FIXSYS=1; }
   { [ "$VC" = behind ] || [ "$VC" = nofix ]; } || return 0
+  fixc "upgrade Go to $FIXV or later (https://go.dev/dl/)"
   case $(where_from "$1") in
     brew)   fix "Upgrade Go to $FIXV or later: brew upgrade go" ;;
     mise)   fix "Upgrade Go to $FIXV or later: mise use -g go@${FIXV%% *}" ;;
@@ -835,6 +911,17 @@ fix_go() {
 
 fix_python() {
   local p=$1 cafile=$2 r1=$3 r2=$4 vc=$5 r3=$6
+  # compact line: most useful single action, in priority order
+  if [ "${r1%%:*}" = trusted ]; then
+    case $cafile in
+      */etc/ca-certificates/*|*/etc/openssl*|*/Cellar/*) fixc "brew upgrade ca-certificates (this Python uses Homebrew's bundle)" ;;
+      ""|None) ;;
+      *) fixc "patch the system CA bundle ($cafile)" ;;
+    esac
+  fi
+  [ "${r2%%:*}" = trusted ] && fixc "pip install --upgrade 'certifi>=2026.10.19'"
+  [ "${r3%%:*}" = trusted ] && fixc "upgrade pip to 26.2.2 or later"
+  [ "$vc" = behind ] && fixc "$p -m pip install --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'"
   if [ "${r1%%:*}" = trusted ]; then
     case $cafile in
       */etc/ca-certificates/*|*/etc/openssl*|*/Cellar/*)
@@ -877,9 +964,19 @@ java_affected_aliases() {
   "$1" -J-Duser.language=en -list -v -keystore "$2" -storepass changeit 2>/dev/null </dev/null | awk "$AWK_JAVA_ALIASES"
 }
 
+# java_upgrade_hint HOW : where to look for a fixed JDK, for the compact guidance line.
+java_upgrade_hint() {
+  case $1 in
+    sdkman) echo "sdk list java" ;;
+    brew)   echo "brew upgrade openjdk" ;;
+    *)      echo "your JDK vendor" ;;
+  esac
+}
+
 fix_java() {
   local h=$1 res=$2 how cac kt n
   how=$(where_from "$h")
+  fixc "upgrade to Java $FIXV or later ($(java_upgrade_hint "$how"))"
   case $how in
     sdkman) fix "sdk list java   # pick a build at or above $FIXV, then:"
             fix "sdk install java <identifier> && sdk default java <identifier>"
@@ -1021,9 +1118,23 @@ node_candidates() {
   done
 }
 
+# node_upgrade_hint HOW : the install command for the version manager in use, for the compact line.
+node_upgrade_hint() {
+  case $1 in
+    nvm)   echo "nvm install $FIXV" ;;
+    volta) echo "volta install node@$FIXV" ;;
+    fnm)   echo "fnm install $FIXV" ;;
+    mise)  echo "mise use -g node@$FIXV" ;;
+    asdf)  echo "asdf install nodejs $FIXV" ;;
+    brew)  echo "brew upgrade node" ;;
+    *)     echo "https://nodejs.org" ;;
+  esac
+}
+
 fix_node() {
   local n=$1 how
   how=$(where_from "$n")
+  fixc "upgrade Node.js to $FIXV or later ($(node_upgrade_hint "$how"))"
   case $how in
     nvm)   fix "nvm install $FIXV && nvm alias default $FIXV   # then: nvm uninstall $(basename "$(dirname "$(dirname "$n")")")" ;;
     volta) fix "volta install node@$FIXV" ;;
@@ -1050,7 +1161,7 @@ fix_node() {
 }
 
 audit_node() {
-  section "Node.js"
+  audit_start "Node.js"
   local found=0 n key v nres extra
   while IFS= read -r n; do
     [ -n "$n" ] && [ -x "$n" ] || continue
@@ -1078,14 +1189,14 @@ audit_node() {
   done <<EOF
 $(node_candidates | awk '!s[$0]++')
 EOF
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
   return 0
 }
 
 # --------------------------------------------------------- Deno / Bun (probe)
 
 audit_deno() {
-  section "Deno"
+  audit_start "Deno"
   local d v found=0
   while IFS= read -r d; do
     [ -n "$d" ] && [ -x "$d" ] || continue
@@ -1099,12 +1210,12 @@ audit_deno() {
   done <<EOF
 $({ command -v deno 2>/dev/null; ls "$HOME"/.deno/bin/deno /opt/homebrew/bin/deno /usr/local/bin/deno 2>/dev/null; } | awk '!s[$0]++')
 EOF
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
   return 0
 }
 
 audit_bun() {
-  section "Bun"
+  audit_start "Bun"
   local b v found=0
   while IFS= read -r b; do
     [ -n "$b" ] && [ -x "$b" ] || continue
@@ -1120,7 +1231,7 @@ audit_bun() {
   done <<EOF
 $({ command -v bun 2>/dev/null; ls "$HOME"/.bun/bin/bun /opt/homebrew/bin/bun /usr/local/bin/bun 2>/dev/null; } | awk '!s[$0]++')
 EOF
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
   return 0
 }
 
@@ -1129,7 +1240,7 @@ EOF
 # audit_simple LABEL BIN-NAME FIXED UPGRADE-COMMAND [EXTRA-CANDIDATE...]
 audit_simple() {
   local label=$1 name=$2 fixed=$3 upg=$4 b v found=0 extra="$5"
-  section "$label"
+  audit_start "$label"
   while IFS= read -r b; do
     [ -n "$b" ] && [ -x "$b" ] || continue
     first_time "$name:$(resolve "$b")" || continue
@@ -1137,6 +1248,7 @@ audit_simple() {
     v=$(version_of "$name" "$b")
     vcmp "$v" "$fixed"
     if [ "$VC" = behind ]; then
+      fixc "$upg"
       fix "Upgrade $label to $fixed or later: $upg"
       [ "$name" = rustup ] && fix "Also check Rust projects: Cargo.lock should resolve rustls-webpki >= 0.103.16 and webpki-roots >= 1.0.10 (cargo update -p rustls-webpki -p webpki-roots)."
     fi
@@ -1144,7 +1256,7 @@ audit_simple() {
   done <<EOF
 $({ command -v "$name" 2>/dev/null; for b in $extra; do [ -x "$b" ] && echo "$b"; done; } | awk '!s[$0]++')
 EOF
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
   return 0
 }
 
@@ -1160,14 +1272,14 @@ version_of() {
 # --------------------------------------------------- Homebrew ca-certificates
 
 audit_brew() {
-  section "Homebrew ca-certificates"
+  audit_start "Homebrew ca-certificates"
   local b prefix link active norm bundle res
   b=$(command -v brew 2>/dev/null)
-  if [ -z "$b" ]; then echo "  Homebrew not found"; echo; return 0; fi
+  if [ -z "$b" ]; then audit_none "Homebrew not found"; return 0; fi
   prefix=$(dirname "$(dirname "$(resolve "$b")")")
   BREW_PREFIX=$prefix
   link="$prefix/opt/ca-certificates"
-  if [ ! -L "$link" ] && [ ! -d "$link" ]; then echo "  ca-certificates formula not installed"; echo; return 0; fi
+  if [ ! -L "$link" ] && [ ! -d "$link" ]; then audit_none "ca-certificates formula not installed"; return 0; fi
   active=$(basename "$(readlink "$link" 2>/dev/null || echo "$link")")
   norm=$(printf '%s' "$active" | tr '_-' '..')
   vcmp "$norm" 2026.09.25.1
@@ -1176,6 +1288,7 @@ audit_brew() {
   if [ -f "$bundle" ]; then res=$(probe_cafile "$bundle"); else res="skipped:bundle $bundle not found"; fi
   if [ "${res%%:*}" = trusted ] || [ "$VC" = behind ]; then
     plan_add brew "$prefix"
+    fixc "brew upgrade ca-certificates"
     fix "brew update && brew upgrade ca-certificates"
     fix "(Homebrew's Python, curl, openssl and others read this bundle. Old versions linger in the Cellar;"
     fix " 'brew cleanup ca-certificates' removes them.)"
@@ -1187,7 +1300,7 @@ audit_brew() {
 # ------------------------------------------------------------ system CA bundles
 
 audit_sysbundle() {
-  section "System CA bundle files"
+  audit_start "System CA bundle files"
   local f key found=0 res brewb=
   [ -n "$BREW_PREFIX" ] && brewb=$(resolve "$BREW_PREFIX/etc/ca-certificates/cert.pem")
   for f in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
@@ -1199,18 +1312,18 @@ audit_sysbundle() {
     first_time "$key" || continue
     found=1
     res=$(probe_cafile "$f")
-    [ "${res%%:*}" = trusted ] && { fix "This bundle still contains the roots the compromised chain leads to: see System trust store below."; FIXSYS=1; }
+    [ "${res%%:*}" = trusted ] && { fixc "patch this bundle (system trust store recipe with -v)"; fix "This bundle still contains the roots the compromised chain leads to: see System trust store below."; FIXSYS=1; }
     report "CA bundle" "$f" "file" na "no version; tested directly" "$res"
   done
-  [ "$found" -eq 0 ] && { echo "  none found"; echo; }
-  [ "$(uname)" = Darwin ] && echo "  Note: macOS's own trust store (Keychain) carries Apple's block since 19 Oct; tools that use it are protected."$'\n'
+  [ "$found" -eq 0 ] && audit_none "none found"
+  [ "$VERBOSE" -ge 1 ] && [ "$(uname)" = Darwin ] && echo "  Note: macOS's own trust store (Keychain) carries Apple's block since 19 Oct; tools that use it are protected."$'\n'
   return 0
 }
 
 # ---------------------------------------------------------------- OS packages
 
 audit_ospkg() {
-  section "OS CA packages"
+  audit_start "OS CA packages"
   local id= vid= ver= fixed= mgr= vc=unknown vn= upg=
   if [ -r /etc/os-release ]; then
     id=$(. /etc/os-release; echo "$ID"); vid=$(. /etc/os-release; echo "$VERSION_ID")
@@ -1249,10 +1362,11 @@ audit_ospkg() {
     fi
   fi
   if [ -z "$mgr" ]; then
-    echo "  no supported package manager / ca-certificates package found (not applicable here)"; echo
+    audit_none "no supported package manager / ca-certificates package found (not applicable here)"
     return 0
   fi
   if [ "$vc" = behind ]; then
+    fixc "$upg"
     fix "$upg"
     fix "If your distribution has not shipped the fix yet, use the workaround in System trust store (below)."
     FIXSYS=1
@@ -1280,9 +1394,9 @@ check_electron_version() {
 }
 
 audit_electron() {
-  section "Electron apps"
+  audit_start "Electron apps"
   if [ "$(uname)" != Darwin ]; then
-    echo "  (macOS apps only for now - not checked on this platform)"; echo; return 0
+    audit_none "(macOS apps only for now - not checked on this platform)"; return 0
   fi
   local f app v found=0
   for f in /Applications/*.app/Contents/Frameworks/"Electron Framework.framework"/Resources/Info.plist \
@@ -1293,12 +1407,13 @@ audit_electron() {
     v=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$f" 2>/dev/null)
     check_electron_version "$v"
     if [ "$VC" = behind ] || [ "$VC" = nofix ]; then
+      fixc "update the app to a build on Electron $FIXV or newer (in-app update, else ask the vendor)"
       fix "Update the app to a release built on Electron ${FIXV} (or newer) (check for an in-app update;"
       fix "if none exists yet, ask the vendor). You cannot patch the embedded runtime yourself."
     fi
     report "Electron app: $(basename "$app" .app)" "$app" "Electron ${v:-?}" "$VC" "$VN" "skipped:cannot probe an app's embedded runtime - version check only"
   done
-  [ "$found" -eq 0 ] && { echo "  no Electron apps found"; echo; }
+  [ "$found" -eq 0 ] && audit_none "no Electron apps found"
   return 0
 }
 
@@ -1328,8 +1443,9 @@ git_probe_all() {
 fix_git() {
   [ "${2%%:*}" = trusted ] || return 0
   case $(where_from "$1") in
-    brew) fix "brew update && brew upgrade git ca-certificates" ;;
+    brew) fixc "brew upgrade git ca-certificates"; fix "brew update && brew upgrade git ca-certificates" ;;
     *)
+      fixc "patch the system CA bundle (or use Homebrew's git)"
       if [ "$1" = /usr/bin/git ] && [ "$(uname)" = Darwin ]; then
         fix "Apple's git reads /etc/ssl/cert.pem and does not check revocation: see System trust store below,"
         fix "or use Homebrew's git: brew install git && brew upgrade ca-certificates"
@@ -1342,7 +1458,7 @@ fix_git() {
 }
 
 audit_git() {
-  section "git"
+  audit_start "git"
   local found=0 g v res out cfg extra
   while IFS= read -r g; do
     [ -n "$g" ] && [ -x "$g" ] || continue
@@ -1371,7 +1487,7 @@ audit_git() {
   done <<EOF
 $({ command -v git 2>/dev/null; ls /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git 2>/dev/null; } | awk '!s[$0]++')
 EOF
-  [ "$found" -eq 0 ] && { echo "  not found"; echo; }
+  [ "$found" -eq 0 ] && audit_none
   return 0
 }
 
@@ -1498,9 +1614,33 @@ EOF
   echo
 }
 
+print_guidance_compact() {
+  if [ -n "$CGUIDE" ]; then
+    printf '%s%sFix first%s (nothing has been run; -v shows full commands)\n' "$C_BLD" "$C_RED" "$C_OFF"
+    printf '%s' "$CGUIDE"
+    if [ "$NEED_SYS" = 1 ]; then
+      echo "  - System CA bundle: upgrade your OS CA package, or distrust the two roots (recipe for this platform with -v)"
+    fi
+    echo
+  fi
+  if [ -n "$CADVISE" ]; then
+    printf '%s%sProtected, but older than the fixed release%s\n' "$C_BLD" "$C_YEL" "$C_OFF"
+    printf '%s' "$CADVISE"
+    echo
+  fi
+  if [ "$FIXMODE" -eq 0 ] && [ "$PLAN" != $'\n' ]; then
+    echo "Apply fixes: ${0##*/} --fix --dry-run   (shows every step, changes nothing), then --fix"
+    echo
+  fi
+}
+
 print_guidance() {
   [ "$NO_GUIDE" -eq 1 ] && return 0
   [ -z "$GUIDE" ] && [ -z "$ADVISE" ] && return 0
+  if [ "$VERBOSE" -lt 1 ]; then
+    print_guidance_compact
+    return 0
+  fi
   section "Remediation guidance"
   if [ "$FIXMODE" -eq 1 ]; then
     echo "  This is guidance only; nothing below has been run yet. Commands that edit system trust"
@@ -1732,6 +1872,19 @@ fix_debian_like() {
   esac
 }
 
+# remove_blocklist_files DIR : delete the three files this script creates in a p11-kit blocklist directory.
+# Refuses unless DIR is a non-empty absolute path to an existing directory, so an unset variable can never
+# turn this into `rm -f /emSign_...` at the filesystem root.
+remove_blocklist_files() {
+  local d=$1
+  case $d in
+    /?*) ;;
+    *) fx_bad "refusing to remove files: directory is empty or not absolute ('$d')"; return 1 ;;
+  esac
+  [ -d "$d" ] || { fx_bad "refusing to remove files: $d is not a directory"; return 1; }
+  as_root rm -f "$d/emSign_ECC_Root_CA_-_G3.pem" "$d/Comodo_AAA_Services_root.pem" "$d/.emudhra-audit-created"
+}
+
 # ---- Fedora/RHEL/SUSE/Arch : add the roots to the p11-kit blocklist
 fix_p11_blocklist() {
   local d bundle
@@ -1765,7 +1918,7 @@ fix_p11_blocklist() {
     rejected) fx_ok "verified: the rebuilt bundle rejects the compromised chain"
               FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - blocklist files in $d (restore with --undo)"$'\n' ;;
     *)        fx_bad "verification failed (${v:-no result}) - removing the blocklist entries"
-              as_root rm -f "$d/emSign_ECC_Root_CA_-_G3.pem" "$d/Comodo_AAA_Services_root.pem" "$d/.emudhra-audit-created"
+              remove_blocklist_files "$d"
               if command -v update-ca-trust >/dev/null 2>&1; then as_root update-ca-trust; else as_root update-ca-certificates; fi
               FAILED_N=$((FAILED_N + 1)) ;;
   esac
@@ -1901,8 +2054,8 @@ fix_macos_pip() {
   if [ -f "$f" ] && grep -qF "$line" "$f"; then fx_ok "already configured in $f"; SKIPPED_N=$((SKIPPED_N + 1)); return; fi
   fx_say "this points Apple's pip at /etc/ssl/cert.pem, so it only helps once that file is patched"
   case $d in
-    */Xcode.app/*|*/CommandLineTools/*)
-      fx_warn "this directory is inside $(case $d in */Xcode.app/*) echo Xcode;; *) echo the Command Line Tools;; esac): updating it will overwrite this change. A virtualenv or Homebrew Python avoids that." ;;
+    */Xcode.app/*)         fx_warn "this directory is inside Xcode: updating Xcode will overwrite this change. A virtualenv or Homebrew Python avoids that." ;;
+    */CommandLineTools/*)  fx_warn "this directory is inside the Command Line Tools: updating them will overwrite this change. A virtualenv or Homebrew Python avoids that." ;;
   esac
   fx_say "would append one line to $f (new file if absent)"
   if [ "$DRY" -eq 1 ]; then
@@ -1922,7 +2075,7 @@ fix_macos_pip() {
     FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - $f: ${bak:+backup at $bak, }created or appended (delete the line to undo)"$'\n'
   else
     fx_bad "$py no longer starts - rolling back"
-    if [ -n "$bak" ]; then as_root cp -p "$bak" "$f"; else as_root rm -f "$f"; fi
+    if [ -n "$bak" ]; then as_root cp -p "$bak" "$f"; elif [ -n "$f" ] && [ "$(basename "$f")" = sitecustomize.py ]; then as_root rm -f "$f"; fi
     FAILED_N=$((FAILED_N + 1))
   fi
 }
@@ -2002,7 +2155,7 @@ run_undo() {
     if [ "$DRY" -eq 1 ]; then fx_say "[dry-run] would remove them and rebuild the bundle"; continue; fi
     confirm "Remove them and rebuild the trust bundle?" || { fx_say "skipped"; continue; }
     need_sudo "$d" || continue
-    as_root rm -f "$d/emSign_ECC_Root_CA_-_G3.pem" "$d/Comodo_AAA_Services_root.pem" "$d/.emudhra-audit-created" || { fx_bad "could not remove them"; continue; }
+    remove_blocklist_files "$d" || { fx_bad "could not remove them"; continue; }
     if command -v update-ca-trust >/dev/null 2>&1; then as_root update-ca-trust; else as_root update-ca-certificates >/dev/null; fi
     fx_ok "removed and rebuilt"
   done
@@ -2027,15 +2180,21 @@ run_undo() {
 
 # ------------------------------------------------------------------- main
 
-printf '%seMudhra intermediate CA compromise - developer tool audit%s (v%s, read-only)\n' "$C_BLD" "$C_OFF" "$VERSION_OF_SCRIPT"
-printf 'Host: %s   Date: %s\n' "$(uname -srm)" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
-printf 'Reference: https://emudhra.we-have-a-problem.com/\n'
-if [ "$NO_NETWORK" -eq 1 ]; then
-  echo "Mode: version checks only (--no-network)"
+if [ "$VERBOSE" -ge 1 ]; then
+  printf '%seMudhra intermediate CA compromise - developer tool audit%s (v%s, read-only)\n' "$C_BLD" "$C_OFF" "$VERSION_OF_SCRIPT"
+  printf 'Host: %s   Date: %s\n' "$(uname -srm)" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  printf 'Reference: https://emudhra.we-have-a-problem.com/\n'
+  if [ "$NO_NETWORK" -eq 1 ]; then
+    echo "Mode: version checks only (--no-network)"
+  else
+    echo "Probe hosts: $BAD_URLS (control: $CONTROL_URL)"
+  fi
+  echo
 else
-  echo "Probe hosts: $BAD_URLS (control: $CONTROL_URL)"
+  printf '%seMudhra CA compromise audit%s v%s - %s - %s%s\n' "$C_BLD" "$C_OFF" "$VERSION_OF_SCRIPT" "$(uname -sm)" "$(date '+%Y-%m-%d')" \
+    "$([ "$NO_NETWORK" -eq 1 ] && echo ' - version checks only')"
+  echo
 fi
-echo
 
 if [ "$UNDO" -eq 1 ]; then
   run_undo
@@ -2061,13 +2220,20 @@ audit_sysbundle
 audit_ospkg
 audit_electron
 
-section "Summary"
-printf '  affected / likely affected: %s\n  ok / likely ok:             %s\n  unknown:                    %s\n' "$N_BAD" "$N_OK" "$N_UNK"
-echo
-echo "Notes: 'AFFECTED'/'OK' come from a live probe. 'LIKELY-*' are version-only."
-echo "Not covered yet: Rust crates in your projects (rustls-webpki, webpki-roots), Perl Mozilla::CA, Composer,"
-echo "Elixir/Erlang, containers and per-project virtualenvs/node_modules."
-echo
+if [ "$VERBOSE" -ge 1 ]; then
+  section "Summary"
+  printf '  affected / likely affected: %s\n  ok / likely ok:             %s\n  unknown:                    %s\n' "$N_BAD" "$N_OK" "$N_UNK"
+  echo
+  echo "Notes: 'AFFECTED'/'OK' come from a live probe. 'LIKELY-*' are version-only."
+  echo "Not covered yet: Rust crates in your projects (rustls-webpki, webpki-roots), Perl Mozilla::CA, Composer,"
+  echo "Elixir/Erlang, containers and per-project virtualenvs/node_modules."
+  echo
+else
+  [ -n "$MISSING" ] && printf '%sNot installed / not applicable:%s %s\n\n' "$C_DIM" "$C_OFF" "$MISSING"
+  printf '%sSummary:%s %s%s affected%s, %s%s ok%s, %s%s unknown%s   (-v for the full report)\n' "$C_BLD" "$C_OFF" \
+    "$C_RED" "$N_BAD" "$C_OFF" "$C_GRN" "$N_OK" "$C_OFF" "$C_YEL" "$N_UNK" "$C_OFF"
+  echo
+fi
 
 print_guidance
 

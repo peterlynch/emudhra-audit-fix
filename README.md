@@ -58,7 +58,8 @@ that page as of 2026-10-22; check the page for updates.
 ```bash
 ./emudhra-audit.sh              # full audit with live TLS probes and guidance
 ./emudhra-audit.sh --no-network # version checks only (no connections)
-./emudhra-audit.sh --verbose    # also show the probe commands and raw TLS errors
+./emudhra-audit.sh -v           # the full report: path, version and probe result for every item
+./emudhra-audit.sh -vv          # also show the probe commands and raw TLS errors
 ./emudhra-audit.sh --fix --dry-run  # show exactly what a fix would do; change nothing
 ```
 
@@ -123,7 +124,16 @@ each tool behaves in your shell, which may differ from a clean login or from CI.
 
 ## Reading the output
 
-Each item gets a status line, then its path, version result and probe result.
+By default the output is a compact summary: one line per item with its status, path and the main reason, one line for
+all the tools that are not installed, a summary count, and one line of guidance per affected item. Use `-v` for the full
+report described below.
+
+```
+[OK] Go go1.26.4  /usr/local/go/bin/go  - rejects the chain, but older than the fixed release (fixed in 1.26.10)
+[AFFECTED] Node.js v24.16.0  ~/.nvm/versions/node/v24.16.0/bin/node  - trusts the compromised chain; also behind (fixed in 24.22.1)
+```
+
+With `-v`, each item gets a status line, then its path, version result and probe result.
 
 | Status | Meaning |
 |---|---|
@@ -141,7 +151,8 @@ At the end there is a summary count, followed by the remediation guidance.
 |---|---|
 | `--no-network` | Skip live probes and make no connections. Items that need a probe to resolve are reported as unknown. |
 | `--no-guidance` | Do not print remediation guidance. |
-| `--verbose` | Print each probe command and the raw TLS errors. |
+| `-v`, `--verbose` | Full report: path, version and probe result for every item, the environment section and complete remediation guidance. |
+| `-vv` | Everything in `-v`, plus each probe command and the raw TLS errors. |
 | `--fix` | After the audit, offer to apply fixes, asking before each change. See [Applying fixes](#applying-fixes---fix). |
 | `--dry-run` | With `--fix`: run every check and show every step, but change nothing. |
 | `--yes` | With `--fix` or `--undo`: do not ask before each change (for unattended use). |
