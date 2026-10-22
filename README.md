@@ -16,9 +16,9 @@
 
 -->
 
-# eMudhra Dev Tools Audit
+# eMudhra Audit & Fix
 
-`emudhra-audit.sh` checks the developer tools installed on a machine against the
+`emudhra-audit-fix.sh` checks the developer tools installed on a machine against the
 [eMudhra intermediate CA compromise](https://emudhra.we-have-a-problem.com/), and prints guidance for fixing anything
 affected. By default it is **read-only**. With `--fix` it can also apply the fixes it knows about, one confirmed change at
 a time, with backups and automatic rollback.
@@ -56,15 +56,15 @@ that page as of 2026-10-22; check the page for updates.
 ## Quick start
 
 ```bash
-./emudhra-audit.sh              # compact audit with live TLS probes: one line per item
-./emudhra-audit.sh --no-network # version checks only (no connections)
-./emudhra-audit.sh -v           # the full report: path, version and probe result for every item
-./emudhra-audit.sh -vv          # also show the probe commands and raw TLS errors
-./emudhra-audit.sh --fix --dry-run  # show exactly what a fix would do; change nothing
-./emudhra-audit.sh --undo --dry-run # show which backups --undo would restore
+./emudhra-audit-fix.sh              # compact audit with live TLS probes: one line per item
+./emudhra-audit-fix.sh --no-network # version checks only (no connections)
+./emudhra-audit-fix.sh -v           # the full report: path, version and probe result for every item
+./emudhra-audit-fix.sh -vv          # also show the probe commands and raw TLS errors
+./emudhra-audit-fix.sh --fix --dry-run  # show exactly what a fix would do; change nothing
+./emudhra-audit-fix.sh --undo --dry-run # show which backups --undo would restore
 ```
 
-No installation is needed. The script is a single file; make it executable with `chmod +x emudhra-audit.sh` if required.
+No installation is needed. The script is a single file; make it executable with `chmod +x emudhra-audit-fix.sh` if required.
 
 ## How it decides
 
@@ -315,7 +315,7 @@ differ on whether macOS updates refresh that file, so re-run the audit after upd
 ## Keeping it current
 
 The fixed versions are hard-coded near the check for each tool (search for `check_*_version`, `vcmp` and
-`audit_simple` in `emudhra-audit.sh`). When the page changes, for example when Bun or Erlang `certifi` ship a fix, update
+`audit_simple` in `emudhra-audit-fix.sh`). When the page changes, for example when Bun or Erlang `certifi` ship a fix, update
 those values and the `VERSION_OF_SCRIPT` number.
 
 ## Development
@@ -336,10 +336,10 @@ discovery, so a fix can be pointed at a copy instead of a real JDK.
 
 ### Releasing
 
-1. Update `VERSION_OF_SCRIPT` in `emudhra-audit.sh`, and the fixed versions if the reference page has changed.
+1. Update `VERSION_OF_SCRIPT` in `emudhra-audit-fix.sh`, and the fixed versions if the reference page has changed.
 2. Run the tests above and check the README still matches the behaviour.
 3. Commit, then tag and push: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
-4. Create the GitHub release with `gh release create vX.Y.Z`, attaching `emudhra-audit.sh`.
+4. Create the GitHub release with `gh release create vX.Y.Z`, attaching `emudhra-audit-fix.sh`.
 
 ## The Fine Print
 

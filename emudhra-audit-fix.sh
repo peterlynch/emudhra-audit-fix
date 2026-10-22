@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# emudhra-audit.sh - read-only audit of developer tools against the eMudhra
+# emudhra-audit-fix.sh - read-only audit of developer tools against the eMudhra
 # intermediate CA compromise: https://emudhra.we-have-a-problem.com/
 #
 # Covers curl, git, Go, Python (incl. pip), Java, Node.js, Deno, Bun, rustup, uv, pixi, mise,
@@ -1909,7 +1909,7 @@ fix_p11_blocklist() {
   as_root mkdir -p "$d"
   as_root trust extract --overwrite --format=pem-bundle --filter='pkcs11:object=emSign%20ECC%20Root%20CA%20-%20G3;type=cert' "$d/emSign_ECC_Root_CA_-_G3.pem"
   as_root trust extract --overwrite --format=pem-bundle --filter='pkcs11:object=Comodo%20AAA%20Services%20root;type=cert' "$d/Comodo_AAA_Services_root.pem"
-  printf 'created by emudhra-audit.sh %s\n' "$STAMP" | $SUDO tee "$d/.emudhra-audit-created" >/dev/null
+  printf 'created by emudhra-audit-fix.sh %s\n' "$STAMP" | $SUDO tee "$d/.emudhra-audit-created" >/dev/null
   if command -v update-ca-trust >/dev/null 2>&1; then as_root update-ca-trust; else as_root update-ca-certificates; fi
   for bundle in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/certs/ca-certificates.crt; do
     [ -f "$bundle" ] && break
