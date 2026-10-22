@@ -34,6 +34,7 @@
 - [Safety](#safety)
 - [Limitations](#limitations)
 - [Keeping it current](#keeping-it-current)
+- [Development](#development)
 - [The Fine Print](#the-fine-print)
 
 ## Background
@@ -200,6 +201,10 @@ have **not** been exercised yet.
 The fixed versions are hard-coded near the check for each tool (search for `check_*_version`, `vcmp` and
 `audit_simple` in `emudhra-audit.sh`). When the page changes, for example when Bun or Erlang `certifi` ship a fix, update
 those values and the `VERSION_OF_SCRIPT` number.
+
+## Development
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for details.
 
 ## The Fine Print
 
