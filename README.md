@@ -194,7 +194,7 @@ release exists; the fixes here distrust two roots, which has side effects.
 | Kind (`--only=`) | What it does | Needs sudo |
 |---|---|---|
 | `brew` | `brew update && brew upgrade ca-certificates` (an upgrade, not a trust-store edit). | no |
-| `sys` | Removes the two roots from the system CA bundle: `/etc/ssl/cert.pem` on macOS; `ca-certificates.conf` plus `update-ca-certificates` on Debian, Ubuntu and Alpine; the p11-kit blocklist on Fedora, RHEL, SUSE and Arch. | yes |
+| `sys` | Removes the two roots from the system CA bundle: `/etc/ssl/cert.pem` on macOS; `ca-certificates.conf` plus `update-ca-certificates` on Debian, Ubuntu and Alpine; the p11-kit blocklist on Fedora, RHEL, SUSE and Arch (only Fedora tested). | yes |
 | `java` | Deletes the two roots from a JDK's `cacerts`. A **stop-gap** for JDKs with no fixed build; a JDK upgrade restores them. | if the JDK is not yours |
 | `macpip` | Appends the page's `PIP_CERT` line to Apple's Python `sitecustomize.py`. | yes |
 
@@ -214,8 +214,7 @@ Each change follows the same sequence:
    automatically.
 
 `--dry-run` stops before step 3 and prints the exact commands. `--undo` restores the newest backup for each store it
-finds. Homebrew upgrades and p11-kit blocklist files are not covered by `--undo`; the notes printed after `--fix` say how
-to reverse them.
+finds. `--undo` also removes the p11-kit blocklist files that `--fix` created. Homebrew upgrades are not covered by `--undo`.
 
 ### Side effects you should expect
 
@@ -233,13 +232,28 @@ to reverse them.
 | Path | Status |
 |---|---|
 | Root-stripping on a real macOS bundle (`tests/test_strip_roots.sh`) | Tested: exactly the two roots removed, all others unchanged by SHA-256. |
-| Java `cacerts` fix, verify, idempotence, `--undo` and rollback | Tested end to end on a throwaway JDK copy. Restoring gave a byte-identical file. |
-| `--dry-run` for `sys`, `java`, `brew` and `macpip` on macOS | Tested. |
+| Java `cacerts`: fix, verify, idempotence, `--undo`, rollback | Tested end to end on a throwaway JDK copy. Restoring gave a byte-identical file. |
+| Debian 12 and Ubuntu 24.04 (`ca-certificates.conf`) | Tested in containers (`tests/test_linux_containers.sh`): affected, fixed, no-op on re-run, undone. |
+| Alpine 3.18 | Tested in a container, same cycle. |
+| Fedora 41 (p11-kit blocklist) | Tested in a container, same cycle. `--undo` removes only the files the script created. |
+| OS package version checks (dpkg, apk, rpm) | Tested on Ubuntu, Debian, Alpine 3.18 and 3.20, and Fedora 41. |
+| `--dry-run` on macOS for `sys`, `java`, `brew` and `macpip` | Tested. |
 | `--yes` validation, no-terminal behaviour, bad flags | Tested. |
-| The macOS system-bundle edit itself (needs sudo), `brew` upgrade, `macpip` | **Not applied for real** in testing. Dry run only. |
-| Debian, Ubuntu, Alpine, Fedora, RHEL, SUSE and Arch fixes | **Not tested.** The code follows the page's recipes but has not been run. |
+| The macOS system-bundle edit itself (needs sudo), `brew` upgrade, `macpip` | **Not applied for real.** Dry run only. |
+| openSUSE/SLES, Arch, NixOS, RHEL/CentOS/Rocky/Alma, Amazon Linux, FreeBSD, NetBSD | **Not tested.** The SUSE and Arch paths reuse the Fedora blocklist code with different directories. |
+| Linux on x86-64 | Tested on arm64 containers only. |
 
-Run the dry run first on any machine, and expect to read what it prints.
+Current distribution images already carry the vendor's fixed package, so the container tests first step
+`ca-certificates` back to an older version to create the unpatched state. Run the dry run first on any machine, and expect
+to read what it prints.
+
+### Known limitations of `--fix`
+
+- On Debian, Ubuntu and Alpine the change is verified **after** it is installed (and rolled back if it fails), not on a
+  copy beforehand. The macOS bundle and Java stores are tested on a copy first.
+- `--undo` does not reverse a Homebrew upgrade.
+- The Alpine and Debian fixes disable the roots in `ca-certificates.conf`; a later `ca-certificates` package upgrade is the
+  proper fix and replaces that file.
 
 ## Requirements and portability
 

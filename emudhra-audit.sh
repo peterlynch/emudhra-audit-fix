@@ -1227,9 +1227,12 @@ audit_ospkg() {
       vn="fixed in $fixed"
     fi
   elif command -v apk >/dev/null 2>&1 && apk info -e ca-certificates >/dev/null 2>&1; then
-    mgr=apk; ver=$(apk info -v ca-certificates 2>/dev/null | head -1 | sed 's/^ca-certificates-//')
+    mgr=apk; ver=$(apk list -I ca-certificates 2>/dev/null | awk '$1 ~ /^ca-certificates-[0-9]/{sub(/^ca-certificates-/, "", $1); print $1; exit}')
     upg="apk update && apk upgrade ca-certificates"; fixed=20261020-r0; vn="fixed in $fixed"
-    if [ "${ver%%-*}" -ge 20261020 ] 2>/dev/null; then vc=ok; else vc=behind; fi
+    case ${ver%%-*} in
+      ""|*[!0-9]*) vc=unknown ;;
+      *)           if [ "${ver%%-*}" -ge 20261020 ]; then vc=ok; else vc=behind; fi ;;
+    esac
   elif command -v pacman >/dev/null 2>&1 && pacman -Q ca-certificates-mozilla >/dev/null 2>&1; then
     mgr=pacman; ver=$(pacman -Q ca-certificates-mozilla 2>/dev/null | awk '{print $2}')
     upg="sudo pacman -Syu ca-certificates-mozilla"; fixed=3.131.1-1; vn="fixed in $fixed"
@@ -1239,7 +1242,8 @@ audit_ospkg() {
     upg="sudo dnf upgrade ca-certificates"
     if [ "$id" = fedora ]; then
       fixed=2026.2.92_v9.0.319; vn="fixed in $fixed"
-      if ver_ge "$ver" "$fixed"; then vc=ok; else vc=behind; fi
+      # Fedora versions look like 2026.2.92_v9.0.319: compare the date-like part, then the _v build part.
+      if ver_ge "${ver%%_v*}" "${fixed%%_v*}" && { [ "${ver%%_v*}" != "${fixed%%_v*}" ] || ver_ge "${ver#*_v}" "${fixed#*_v}"; }; then vc=ok; else vc=behind; fi
     else
       vn="the page lists no fixed package for this distribution"
     fi
@@ -1704,7 +1708,8 @@ fix_debian_like() {
   if cmp -s "$conf" "$new"; then
     fx_ok "already clean - both roots are already disabled (or not listed)"; SKIPPED_N=$((SKIPPED_N + 1)); return
   fi
-  fx_say "would disable: $(diff "$conf" "$new" | sed -n 's/^> !//p' | tr '\n' ' ')"
+  # List the entries being disabled without depending on diff's output format (BusyBox differs).
+  fx_say "would disable: $(grep -E '^mozilla/(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.crt' "$conf" | tr '\n' ' ')"
   if [ "$DRY" -eq 1 ]; then
     fx_say "[dry-run] would back up to $conf.$BACKUP_TAG-$STAMP, install the edited file and run update-ca-certificates"
     need_sudo "$conf" >/dev/null 2>&1 || true
@@ -1750,6 +1755,7 @@ fix_p11_blocklist() {
   as_root mkdir -p "$d"
   as_root trust extract --overwrite --format=pem-bundle --filter='pkcs11:object=emSign%20ECC%20Root%20CA%20-%20G3;type=cert' "$d/emSign_ECC_Root_CA_-_G3.pem"
   as_root trust extract --overwrite --format=pem-bundle --filter='pkcs11:object=Comodo%20AAA%20Services%20root;type=cert' "$d/Comodo_AAA_Services_root.pem"
+  printf 'created by emudhra-audit.sh %s\n' "$STAMP" | $SUDO tee "$d/.emudhra-audit-created" >/dev/null
   if command -v update-ca-trust >/dev/null 2>&1; then as_root update-ca-trust; else as_root update-ca-certificates; fi
   for bundle in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/certs/ca-certificates.crt; do
     [ -f "$bundle" ] && break
@@ -1757,9 +1763,9 @@ fix_p11_blocklist() {
   v=$(probe_cafile "$bundle")
   case ${v%%:*} in
     rejected) fx_ok "verified: the rebuilt bundle rejects the compromised chain"
-              FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - blocklist files in $d (remove them and re-run update-ca-trust to undo)"$'\n' ;;
+              FIXED_N=$((FIXED_N + 1)); FIX_NOTES="${FIX_NOTES}  - blocklist files in $d (restore with --undo)"$'\n' ;;
     *)        fx_bad "verification failed (${v:-no result}) - removing the blocklist entries"
-              as_root rm -f "$d/emSign_ECC_Root_CA_-_G3.pem" "$d/Comodo_AAA_Services_root.pem"
+              as_root rm -f "$d/emSign_ECC_Root_CA_-_G3.pem" "$d/Comodo_AAA_Services_root.pem" "$d/.emudhra-audit-created"
               if command -v update-ca-trust >/dev/null 2>&1; then as_root update-ca-trust; else as_root update-ca-certificates; fi
               FAILED_N=$((FAILED_N + 1)) ;;
   esac
@@ -1986,6 +1992,20 @@ run_undo() {
       [ -n "$d" ] && [ -n "$(newest_backup "$d/sitecustomize.py")" ] && echo "$d/sitecustomize.py"
     fi
   )
+  # p11-kit blocklist entries this script created (identified by its marker file)
+  for d in /etc/pki/ca-trust/source/blocklist /etc/pki/ca-trust/source/blacklist /etc/pki/trust/blocklist \
+           /etc/pki/trust/blacklist /etc/ca-certificates/trust-source/blocklist; do
+    [ -f "$d/.emudhra-audit-created" ] || continue
+    any=1
+    fx_say "${C_BLD}$d${C_OFF}"
+    fx_say "remove the blocklist entries this script added (emSign_ECC_Root_CA_-_G3.pem, Comodo_AAA_Services_root.pem)"
+    if [ "$DRY" -eq 1 ]; then fx_say "[dry-run] would remove them and rebuild the bundle"; continue; fi
+    confirm "Remove them and rebuild the trust bundle?" || { fx_say "skipped"; continue; }
+    need_sudo "$d" || continue
+    as_root rm -f "$d/emSign_ECC_Root_CA_-_G3.pem" "$d/Comodo_AAA_Services_root.pem" "$d/.emudhra-audit-created" || { fx_bad "could not remove them"; continue; }
+    if command -v update-ca-trust >/dev/null 2>&1; then as_root update-ca-trust; else as_root update-ca-certificates >/dev/null; fi
+    fx_ok "removed and rebuilt"
+  done
   for f in $(printf '%s\n' "$cands" | awk '!s[$0]++'); do
     b=$(newest_backup "$f")
     [ -z "$b" ] && continue
@@ -2001,7 +2021,7 @@ run_undo() {
     esac
   done
   [ "$any" -eq 0 ] && echo "  No ${BACKUP_TAG} backups found in the usual places."
-  echo "  Homebrew upgrades and p11-kit blocklist files are not covered by --undo (see the notes printed by --fix)."
+  echo "  Homebrew upgrades are not covered by --undo (see the notes printed by --fix)."
   echo
 }
 
